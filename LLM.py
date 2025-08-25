@@ -1,5 +1,6 @@
 from pathlib import Path
 import requests
+from Agent import resultsFromLLM
 def init():
     check1 = checkAPIconnectionWithLLM()
     check2 = checkAPIconnectionWithAgent()
@@ -77,7 +78,7 @@ def sendToLLM(content):
     try:
         response = requests.post(url, headers=headers, json=data, timeout=15)
         if response.status_code == 200:
-            #TODO send to Agent
+            resultsFromLLM(response.json())
             pass
         else:
             print(f"Error: {response.status_code}, {response.text}")

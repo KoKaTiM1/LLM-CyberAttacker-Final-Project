@@ -1,5 +1,7 @@
 import json
 import requests
+from Facftory import process_vulnerability_and_attack
+
 def resultsFromLLM(LLMresult):
     API_KEY = ""
     url = ""
@@ -29,13 +31,11 @@ def resultsFromLLM(LLMresult):
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=15)
         if response.status_code == 200:
-            #TODO send to factory
-            pass
+            process_vulnerability_and_attack(LLMresult)
+
         else:
             print(f"Error: {response.status_code}, {response.text}")
             return None
     except Exception as e:
         print(f"Request failed: {e}")
         return None
-
-
