@@ -1,8 +1,15 @@
 from abc import ABC, abstractmethod
 import json
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
 
 
-class AttackBase(ABC):
+class Attack_Base(ABC):
     """Base class for all attack types"""
 
     @abstractmethod
@@ -16,43 +23,45 @@ class AttackBase(ABC):
         pass
 
 
-class BufferOverflowAttack(AttackBase):
+class Buffer_Overflow_Attack(Attack_Base):
     """Concrete implementation for Buffer Overflow attacks"""
 
     def execute_attack(self, vulnerability_data: dict):
         """Execute Buffer Overflow attack based on vulnerability data"""
-        return f"Executing Buffer Overflow attack at {vulnerability_data.get('Location', 'unknown location')}"
+        return f"Executing buffer_overflow attack at {vulnerability_data.get('Location', 'unknown location')}"
 
     def get_attack_type(self) -> str:
         """Return attack type name"""
-        return "Buffer Overflow"
+        return "buffer_overflow"
 
 
 
-class FormatStringAttack(AttackBase):
-
-    def execute_attack(self, vulnerability_data: dict):
-        return f"Executing Format String attack at {vulnerability_data.get('Location', 'unknown location')}"
-
-    def get_attack_type(self) -> str:
-        return "Format String"
-
-
-class UseAfterFreeAttack(AttackBase):
+class Format_String_Attack(Attack_Base):
 
     def execute_attack(self, vulnerability_data: dict):
-        return f"Executing Use After Free attack at {vulnerability_data.get('Location', 'unknown location')}"
+        return f"Executing format_string attack at {vulnerability_data.get('Location', 'unknown location')}"
 
     def get_attack_type(self) -> str:
-        return "Use After Free"
+        return "format_string"
 
 
-class AttackFactory:
+class Use_After_Free_Attack(Attack_Base):
+
+    def execute_attack(self, vulnerability_data: dict):
+        return f"Executing use_after_free attack at {vulnerability_data.get('Location', 'unknown location')}"
+
+    def get_attack_type(self) -> str:
+        return "use_after_free"
+
+
+class Attack_Factory:
     """Factory class for creating attack objects based on vulnerability type"""
 
     # Registry mapping vulnerability types to attack classes
     _attack_registry = {
-        "buffer overflow": BufferOverflowAttack,
+        "buffer overflow": Buffer_Overflow_Attack,
+        "format string": Format_String_Attack,
+        "use after free": Use_After_Free_Attack,
     }
 
     @classmethod
@@ -62,10 +71,9 @@ class AttackFactory:
         # Normalize input to lowercase
         normalized_type = vulnerability_type.lower().strip()
 
-        # Find matching attack class in registry
-        for registered_type, attack_class in cls._attack_registry.items():
-            if registered_type in normalized_type or normalized_type in registered_type:
-                return attack_class()  # Create and return attack instance
+        attack_class = cls._attack_registry.get(normalized_type)
+        if attack_class:
+            return attack_class()
 
         # No match found - raise error
         raise ValueError(f"Unsupported vulnerability type: {vulnerability_type}")
@@ -73,8 +81,8 @@ class AttackFactory:
     @classmethod
     def register_attack(cls, vulnerability_type: str, attack_class: type):
 
-        if not issubclass(attack_class, AttackBase):
-            raise ValueError("Attack class must inherit from AttackBase")
+        if not issubclass(attack_class, Attack_Base):
+            raise ValueError("Attack class must inherit from Attack Base")
 
         cls._attack_registry[vulnerability_type.lower()] = attack_class
 
@@ -93,28 +101,28 @@ def process_vulnerability_and_attack(llm_result: str) -> str:
         if not vulnerability_data.get("Explanation"):
             raise ValueError("Missing vulnerability explanation in LLM result")
 
-        attack = AttackFactory.create_attack(vulnerability_data["Type"])
+        attack = Attack_Factory.create_attack(vulnerability_data["Type"])
 
         result = attack.execute_attack(vulnerability_data)
 
-        print(f"Attack Type: {attack.get_attack_type()}")
-        print(f"Vulnerability: {vulnerability_data['Type']}")
-        print(f"Location: {vulnerability_data['Location']}")
-        print(f"Result: {result}")
+        logging.info(f"Attack Type: {attack.get_attack_type()}")
+        logging.info(f"Vulnerability: {vulnerability_data['Type']}")
+        logging.info(f"Location: {vulnerability_data['Location']}")
+        logging.info(f"Result: {result}")
 
         return result
 
     except json.JSONDecodeError as e:
         error_msg = f"Failed to parse LLM result JSON: {e}"
-        print(error_msg)
+        logging.error(error_msg)
         return error_msg
 
     except ValueError as e:
         error_msg = f"Vulnerability processing error: {e}"
-        print(error_msg)
+        logging.error(error_msg)
         return error_msg
 
     except Exception as e:
         error_msg = f"Unexpected error in attack processing: {e}"
-        print(error_msg)
+        logging.error(error_msg)
         return error_msg
