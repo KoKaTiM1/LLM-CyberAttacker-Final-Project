@@ -1,44 +1,29 @@
 from pathlib import Path
+from urllib import response
 import requests
 from Agent import resultsFromLLM
-def init():
-    check1 = checkAPIconnectionWithLLM()
-    check2 = checkAPIconnectionWithAgent()
-    if check1 and check2:
-        file_path_input = input("please enter full path to file: ").strip().strip('"')
-        file_path = Path(file_path_input)
-        content = getFile(file_path)
-        if content is not None:
-            print("file loaded OK")
-            getFile(file_path)
-    else:
-        if check1 and check2:
-            print("Both API's lost connection")
-        elif check1 is False:
-            print("LLM API connection lost")
-        elif check2 is False:
-            print("Agent API connection lost")
+   
 
 
-def getFile(path: Path):
+def getFile(path: Path) -> bool:
     if not path.exists() or not path.is_file():
         print("file not found")
-        return None
+        return False
 
     if path.suffix.lower() != ".c":
         print("this is not C file")
-        return None
+        return False
 
     try:
         fileContent = path.read_text(encoding="utf-8", errors="ignore")
     except Exception as e:
         print(f"failed to read file: {e}")
-        return None
+        return False
 
     if len(fileContent.strip()) == 0:
         print("empty file")
-        return None
-    sendToLLM(fileContent)
+        return False
+    return True
 
 
 def checkAPIconnectionWithLLM() -> bool:
@@ -86,3 +71,4 @@ def sendToLLM(content):
     except Exception as e:
         print(f"Request failed: {e}")
         return None
+    return response.json()

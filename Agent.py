@@ -1,6 +1,6 @@
 import json
 import requests
-from Facftory import process_vulnerability_and_attack
+from Factory import process_vulnerability_and_attack
 
 def resultsFromLLM(LLMresult):
     API_KEY = ""
@@ -39,3 +39,4 @@ def resultsFromLLM(LLMresult):
     except Exception as e:
         print(f"Request failed: {e}")
         return None
+    return response.json()
