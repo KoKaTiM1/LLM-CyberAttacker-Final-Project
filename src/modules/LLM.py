@@ -1,7 +1,7 @@
 from pathlib import Path
 from urllib import response
 import requests
-from Agent import resultsFromLLM
+from .Agent import resultsFromLLM
    
 
 

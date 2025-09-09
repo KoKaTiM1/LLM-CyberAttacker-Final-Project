@@ -1,6 +1,6 @@
 import json
 import requests
-from Factory import process_vulnerability_and_attack
+from .Factory import process_vulnerability_and_attack
 
 def resultsFromLLM(LLMresult):
     API_KEY = ""

@@ -19,9 +19,9 @@ from typing import Dict, Any, Callable, List
 from enum import Enum
 
 # Import existing components
-from LLM import getFile, sendToLLM, checkAPIconnectionWithLLM, checkAPIconnectionWithAgent
-from Agent import resultsFromLLM
-from Factory import Attack_Factory
+from .LLM import getFile, sendToLLM, checkAPIconnectionWithLLM, checkAPIconnectionWithAgent
+from .Agent import resultsFromLLM
+from .Factory import Attack_Factory
 
 # Configure logging
 logging.basicConfig(
