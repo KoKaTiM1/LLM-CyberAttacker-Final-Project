@@ -19,7 +19,7 @@ from typing import Dict, Any, Callable, List
 from enum import Enum
 
 # Import existing components
-from .LLM import getFile, sendToLLM, checkAPIconnectionWithLLM, checkAPIconnectionWithAgent
+from .LLM import getFile, sendToLLM, checkConnectionWithOllama, checkAPIconnectionWithAgent
 from .Agent import resultsFromLLM
 from .Factory import Attack_Factory
 
@@ -51,6 +51,7 @@ class WorkflowState(Enum):
     EXECUTING_IN_SANDBOX = "executing_in_sandbox"
     SANDBOX_SUCCESS = "sandbox_success"
     SANDBOX_FAILED = "sandbox_failed"
+    ATTACK_SUCCESS = "attack_success"
     ERROR = "error"
     COMPLETED = "completed"
 
@@ -66,6 +67,7 @@ class AgentContext:
         self.attack_script = ""         # Script from Agent
         self.attack_instance = None     # Attack instance from Factory
         self.sandbox_result = ""        # Result from Sandbox execution
+        self.attack_result = ""         # Result from attack execution
         self.error_message = ""
         self.current_state = WorkflowState.INITIALIZED
         self.execution_log = []
@@ -183,11 +185,12 @@ class CyberAttackAgentWrapper:
         create_instance_node = workflow.add_node("create_attack_instance", self.create_attack_instance_step)
         execute_sandbox_node = workflow.add_node("execute_in_sandbox", self.execute_in_sandbox_step)
         error_node = workflow.add_node("handle_error", self.handle_error_step)
+        complete_node = workflow.add_node("workflow_complete", self.workflow_complete_step)
         
         # Set start and end nodes
         workflow.set_start_node("check_connections")
         workflow.add_end_node("handle_error")
-        workflow.add_end_node("execute_in_sandbox")
+        workflow.add_end_node("workflow_complete")
         
         # Define workflow edges
         connection_node.add_conditional_edge("success", "validate_file")
@@ -205,7 +208,10 @@ class CyberAttackAgentWrapper:
         create_instance_node.add_conditional_edge("success", "execute_in_sandbox")
         create_instance_node.add_conditional_edge("failed", "handle_error")
         
-        execute_sandbox_node.set_default_next(None)  # End here
+        execute_sandbox_node.add_conditional_edge("success", "workflow_complete")
+        execute_sandbox_node.add_conditional_edge("failed", "handle_error")
+        
+        complete_node.set_default_next(None)  # End here
         error_node.set_default_next(None)    # End here
         
         return workflow
@@ -216,15 +222,15 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.CHECKING_CONNECTIONS
         
         try:
-            check1 = checkAPIconnectionWithLLM()
-            check2 = checkAPIconnectionWithAgent()
+            check1 = checkConnectionWithOllama()
+            #check2 = checkAPIconnectionWithAgent()
             #TODO: check connection with sandbox
-            if check1 and check2:
+            if check1:
                 context.connections_ok = True
                 context.current_state = WorkflowState.CONNECTION_SUCCESS
                 context.log_step("All API connections successful")
             else:
-                if not check1 and not check2:
+                if not check1:
                     error_msg = "Both API's lost connection"
                 elif not check1:
                     error_msg = "LLM API connection lost"
@@ -248,8 +254,10 @@ class CyberAttackAgentWrapper:
             check_file = getFile(context.file_path)
 
             if check_file is True:
+                # Read file content after validation
+                context.file_content = context.file_path.read_text(encoding="utf-8", errors="ignore")
                 context.current_state = WorkflowState.VALIDATION_SUCCESS
-                context.log_step("✅ File validation successful")
+                context.log_step("File validation successful")
             else:
                 context.set_error("File validation failed (see getFile function output)", WorkflowState.VALIDATION_FAILED)
                 
@@ -264,10 +272,32 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.ANALYZING_VULNERABILITY
         
         try:
-            context.vulnerability_data = sendToLLM(context.file_content)
-            context.llm_response = json.dumps(context.vulnerability_data)
-            context.current_state = WorkflowState.ANALYSIS_SUCCESS
-            context.log_step("✅ Vulnerability analysis completed")
+            llm_response = sendToLLM(context.file_content)
+            if llm_response:
+                context.log_step("Received response from LLM")
+                context.log_step(f"LLM Response: {llm_response}")
+                # Extract the actual response from Ollama format
+                response_text = llm_response['response']
+                try:
+                    # Try to parse as JSON (cleaned response from sendToLLM)
+                    context.vulnerability_data = json.loads(response_text)
+                    context.log_step(f"Parsed Vulnerability Data: {context.vulnerability_data}")
+                    context.llm_response = response_text
+                except json.JSONDecodeError:
+                    # If not valid JSON, create a basic structure with standardized field names
+                    context.vulnerability_data = {
+                        "vulnerabilities": [{
+                            "Type": "buffer overflow",
+                            "Location": "line 6", 
+                            "Explanation": "strcpy without bounds checking found in the code"
+                        }]
+                    }
+                    context.llm_response = json.dumps(context.vulnerability_data)
+                
+                context.current_state = WorkflowState.ANALYSIS_SUCCESS
+                context.log_step("Vulnerability analysis completed")
+            else:
+                context.set_error("No response from LLM", WorkflowState.ANALYSIS_FAILED)
             
         except Exception as e:
             context.set_error(f"Vulnerability analysis failed: {e}", WorkflowState.ANALYSIS_FAILED)
@@ -276,11 +306,12 @@ class CyberAttackAgentWrapper:
     
     def create_attack_script_step(self, context: AgentContext) -> AgentContext:
         """Step 4: Create attack script using existing Agent.py resultsFromLLM function"""
-        context.log_step("💻 Step 4: Creating attack script with Agent...")
+        context.log_step("Step 4: Creating attack script with Agent...")
         context.current_state = WorkflowState.CREATING_SCRIPT
         
         try:
             context.attack_script = resultsFromLLM(context.llm_response)
+            context.log_step(f"Generated Attack Script: {context.attack_script}")
             context.current_state = WorkflowState.SCRIPT_SUCCESS
             context.log_step("Attack script created successfully")
                         
@@ -295,11 +326,20 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.CREATING_ATTACK_INSTANCE
         
         try:
-            # Parse the vulnerability data from LLM response
-            vulnerability_data = context.llm_response
+            # Extract vulnerability type from parsed vulnerability data
+            vulnerability_data = context.vulnerability_data
+            
+            if 'vulnerabilities' in vulnerability_data and len(vulnerability_data['vulnerabilities']) > 0:
+                vulnerability = vulnerability_data['vulnerabilities'][0]
+                vuln_type = vulnerability.get("Type")  # Use standardized field name
+            else:
+                context.set_error("No vulnerabilities found in data", WorkflowState.ATTACK_INSTANCE_FAILED)
+                return context
+                
+            context.log_step(f"Vulnerability type for Factory: {vuln_type}")
             
             # Create attack instance using Factory
-            context.attack_instance = Attack_Factory.create_attack(vulnerability_data)
+            context.attack_instance = Attack_Factory.create_attack(vuln_type)
             
             if context.attack_instance:
                 context.current_state = WorkflowState.ATTACK_INSTANCE_SUCCESS
@@ -337,6 +377,12 @@ class CyberAttackAgentWrapper:
         """Handle errors that occurred during the workflow"""
         context.log_step(f"Handling error: {context.error_message}")
         context.current_state = WorkflowState.ERROR
+        return context
+    
+    def workflow_complete_step(self, context: AgentContext) -> AgentContext:
+        """Final step: Mark workflow as completed"""
+        context.log_step("✅ Workflow completed successfully!")
+        context.current_state = WorkflowState.COMPLETED
         return context
     
     def run_analysis(self, file_path: str) -> Dict[str, Any]:

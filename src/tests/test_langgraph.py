@@ -3,6 +3,10 @@
 Test script for the LangGraph wrapper implementation
 """
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from src.modules.agent_langgraph_wrapper import CyberAttackAgentWrapper
 import json
 
@@ -15,7 +19,7 @@ def test_langgraph_wrapper():
     wrapper = CyberAttackAgentWrapper()
     
     # Test with a sample file from the dataset
-    test_file = "../data/LCP-Data set/Files/File1.txt"
+    test_file = "src/data/LCP-Data set/Files/File1.txt"
     
     try:
         # Run the analysis workflow
