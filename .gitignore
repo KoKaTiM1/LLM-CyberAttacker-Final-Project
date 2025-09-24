@@ -119,6 +119,7 @@ dmypy.json
 *.key
 config.py
 secrets.json
+sandbox_config.json
 
 # OS
 .DS_Store
