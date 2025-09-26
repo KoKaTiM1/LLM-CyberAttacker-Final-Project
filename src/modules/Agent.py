@@ -1,0 +1,85 @@
+import json
+import requests
+
+def resultsFromLLM(LLMresult):
+    try:
+        data = json.loads(LLMresult)
+        
+        # Handle structured JSON with vulnerabilities array
+        if 'vulnerabilities' in data and len(data['vulnerabilities']) > 0:
+            vulnerability = data['vulnerabilities'][0]
+        else:
+            print("No vulnerabilities found in JSON")
+            return None
+            
+        # Use standardized field names (Type, Location, Explanation)
+        if not vulnerability.get("Type") or not vulnerability.get("Location") or not vulnerability.get("Explanation"):
+            print("Json file from LLM is missing details")
+            return None
+            
+        url = "http://localhost:11434/api/generate"
+        prompt = (
+            "You are an expert exploit developer. "
+            "Here is a vulnerability that was found in a C file:\n"
+            f"Type: {vulnerability['Type']}\n"
+            f"Location: {vulnerability['Location']}\n"
+            f"Explanation: {vulnerability['Explanation']}\n"
+            "Please generate a Python proof-of-concept exploit script that demonstrates how this vulnerability can be exploited. "
+            "The script should be runnable and include necessary comments."
+        )
+        payload = {
+            "model": "gpt-oss:20b",
+            "prompt": prompt,
+            "stream": False
+        }
+        response = requests.post(url, json=payload, timeout=60000)
+        print(f"Exploit Generation Response Status: {response.status_code}")
+        if response.status_code == 200:
+            print(f"Exploit Generation Response: {response.json()}")
+            return response.json()
+        else:
+            print(f"Error: {response.status_code}, {response.text}")
+            return None
+    except Exception as e:
+        print(f"Request failed: {e}")
+        return None
+'''
+def resultsFromLLM(LLMresult):
+    API_KEY = ""
+    url = ""
+    data = json.loads(LLMresult)
+    if not data["Type"] or not data["Location"] or not data["Explanation"]:
+        print("Json file from LLM is missing details")
+        return
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    payload = {
+        "model": "oss-20b",
+        "messages": [
+            {"role": "system", "content": "You are an expert exploit developer."},
+            {"role": "user", "content": f"""Here is a vulnerability that was found in a C file:
+
+    Type: {data["Type"]}
+    Location: {data["Location"]}
+    Explanation: {data["Explanation"]}
+
+    Please generate a Python proof-of-concept exploit script that demonstrates how this vulnerability can be exploited.
+    The script should be runnable and include necessary comments."""}
+        ]
+    }
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        if response.status_code == 200:
+            process_vulnerability_and_attack(LLMresult)
+
+        else:
+            print(f"Error: {response.status_code}, {response.text}")
+            return None
+    except Exception as e:
+        print(f"Request failed: {e}")
+        return None
+        return response.json()
+'''
