@@ -403,8 +403,8 @@ class CyberAttackAgentWrapper:
                 
                 # Execute in all available sandbox environments
                 context.log_step("Starting sandbox execution...")
-                results = sandbox_manager.execute_in_all_environments(
-                    script_text)
+                results = sandbox_manager.execute_exploit(
+                    script_text, context.vulnerability_data)
                 context.sandbox_result = results
                 context.log_step("Sandbox execution completed!")
                 context.log_step(f"Results: {results}")
