@@ -1,15 +1,26 @@
 @echo off
-set VM=UbuntuVM_flat
-set U=sandbox
-set P=1234
-set PY=/home/sandbox/venv/bin/python
+echo Reading configuration from sandbox_config.json...
+
+rem Use PowerShell to read JSON configuration
+for /f "delims=" %%i in ('powershell -Command "(Get-Content '%~dp0..\sandbox_config.json' | ConvertFrom-Json).environments.virtualbox.vm_name"') do set VM=%%i
+for /f "delims=" %%i in ('powershell -Command "(Get-Content '%~dp0..\sandbox_config.json' | ConvertFrom-Json).environments.virtualbox.username"') do set U=%%i
+for /f "delims=" %%i in ('powershell -Command "(Get-Content '%~dp0..\sandbox_config.json' | ConvertFrom-Json).environments.virtualbox.password"') do set P=%%i
+for /f "delims=" %%i in ('powershell -Command "(Get-Content '%~dp0..\sandbox_config.json' | ConvertFrom-Json).environments.virtualbox.python_path"') do set PY=%%i
+for /f "delims=" %%i in ('powershell -Command "$config = (Get-Content '%~dp0..\sandbox_config.json' | ConvertFrom-Json); if ($config.environments.virtualbox.startup_wait_time) { $config.environments.virtualbox.startup_wait_time } else { 60 }"') do set WAIT_TIME=%%i
+
+echo Configuration loaded:
+echo VM Name: %VM%
+echo Username: %U%
+echo Python Path: %PY%
+echo Wait Time: %WAIT_TIME% seconds
+echo.
 
 echo Starting VM headless...
 VBoxManage startvm "%VM%" --type headless
 
-rem Wait 60 seconds for VM and Guest Additions to fully load
-echo Waiting 60 seconds for VM and Guest Additions to fully initialize...
-timeout /t 60 >nul
+rem Wait for VM and Guest Additions to fully load
+echo Waiting %WAIT_TIME% seconds for VM and Guest Additions to fully initialize...
+timeout /t %WAIT_TIME% >nul
 echo VM should be ready now ^^^
 
 echo whoami:
