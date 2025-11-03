@@ -510,7 +510,7 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 
                 # Wait for VM to boot
                 logger.info("Waiting for VM to boot...")
-                time.sleep(45)
+                time.sleep(90)
             
             self.is_connected = True
             logger.info(f"Connected to VirtualBox VM: {self.vm_name}")
@@ -523,13 +523,35 @@ class VirtualBoxEnvironment(SandboxEnvironment):
     def disconnect(self) -> bool:
         """Disconnect from VirtualBox VM"""
         try:
-            # Save state of the VM
+            # Shutdown the VM gracefully
             result = subprocess.run(
-                [self.vboxmanage_path, "controlvm", self.vm_name, "savestate"],
+                [self.vboxmanage_path, "controlvm", self.vm_name, "acpipowerbutton"],
                 capture_output=True,
                 text=True,
                 timeout=30
             )
+            
+            if result.returncode == 0:
+                # Wait a bit for graceful shutdown
+                logger.info(f"Initiating graceful shutdown of VM: {self.vm_name}")
+                time.sleep(10)
+                
+                # Check if VM is still running, force shutdown if needed
+                check_result = subprocess.run(
+                    [self.vboxmanage_path, "showvminfo", self.vm_name, "--machinereadable"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if check_result.returncode == 0 and "VMState=\"running\"" in check_result.stdout:
+                    logger.info("VM still running, forcing poweroff...")
+                    subprocess.run(
+                        [self.vboxmanage_path, "controlvm", self.vm_name, "poweroff"],
+                        capture_output=True,
+                        text=True,
+                        timeout=15
+                    )
             
             self.is_connected = False
             logger.info(f"Disconnected from VirtualBox VM: {self.vm_name}")
@@ -556,20 +578,31 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             # Create a temporary script file path in the VM
             script_file = "/tmp/sandbox_script.py"
             
-            # Copy script to VM using guestcontrol
-            copy_cmd = [
-                self.vboxmanage_path, "guestcontrol", self.vm_name,
-                "copyto", "--username", self.username, "--password", self.password,
-                "/dev/stdin", script_file
-            ]
+            # Create a temporary file on the host system first
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+                temp_file.write(script_content)
+                temp_host_file = temp_file.name
             
-            copy_result = subprocess.run(
-                copy_cmd,
-                input=script_content,
-                text=True,
-                capture_output=True,
-                timeout=30
-            )
+            try:
+                # Copy script from host to VM using guestcontrol
+                copy_cmd = [
+                    self.vboxmanage_path, "guestcontrol", self.vm_name,
+                    "copyto", "--username", self.username, "--password", self.password,
+                    temp_host_file, script_file
+                ]
+                
+                copy_result = subprocess.run(
+                    copy_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+            finally:
+                # Clean up temporary host file
+                try:
+                    os.unlink(temp_host_file)
+                except Exception:
+                    pass
             
             if copy_result.returncode != 0:
                 execution_time = time.time() - start_time
@@ -585,7 +618,7 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             exec_cmd = [
                 self.vboxmanage_path, "guestcontrol", self.vm_name,
                 "run", "--username", self.username, "--password", self.password,
-                "--exe", self.python_path, "--", "python3", script_file
+                "--exe", self.python_path, "--", script_file
             ]
             
             exec_result = subprocess.run(
@@ -706,9 +739,23 @@ class SandboxManager:
             return False
     
     def connect_all(self) -> bool:
-        """Connect to all environments"""
+        """Connect to all environments with optimal ordering"""
         success = True
+        
+        # Connect in optimal order: VirtualBox first (slow boot), then fast environments
+        connection_order = []
+        
+        # VirtualBox first (takes longest to boot)
         for name, env in self.environments.items():
+            if "VirtualBox" in name:
+                connection_order.append((name, env))
+        
+        # Then other environments (Docker, E2B)
+        for name, env in self.environments.items():
+            if "VirtualBox" not in name:
+                connection_order.append((name, env))
+        
+        for name, env in connection_order:
             logger.info(f"Connecting to {name}...")
             if not env.connect():
                 logger.error(f"Failed to connect to {name}")
@@ -997,7 +1044,7 @@ def main():
     """Main function"""
     parser = argparse.ArgumentParser(description="Multi-Environment Sandbox System")
     parser.add_argument("--config", "-c", help="Configuration file path", 
-                       default="sandbox_config_final.json")
+                       default="sandbox_config.json")
     parser.add_argument("--interactive", "-i", action="store_true", 
                        help="Run in interactive mode")
     parser.add_argument("--test", "-t", help="Run specific test script")
