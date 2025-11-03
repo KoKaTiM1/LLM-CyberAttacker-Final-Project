@@ -22,6 +22,7 @@ from enum import Enum
 from .LLM import getFile, sendToLLM, checkConnectionWithOllama, checkAPIconnectionWithAgent
 from .Agent import resultsFromLLM
 from .Factory import Attack_Factory
+from .sandbox import SandboxManager
 
 # Configure logging
 logging.basicConfig(
@@ -362,8 +363,54 @@ class CyberAttackAgentWrapper:
                 context.set_error("No attack instance available for execution", WorkflowState.SANDBOX_FAILED)
                 return context
             
-            # Execute the attack instance
-            context.sandbox_result = context.attack_instance.execute()
+            # Execute the attack instance with vulnerability data first
+            vulnerability = context.vulnerability_data.get('vulnerabilities', [{}])[0]
+            context.attack_result = context.attack_instance.execute_attack(vulnerability)
+            context.log_step(f"Attack instance result: {context.attack_result}")
+            
+            # Now execute the attack script in actual sandbox environments
+            context.log_step(f"Attack script type: {type(context.attack_script)}")
+            context.log_step(f"Attack script available: {bool(context.attack_script)}")
+            context.log_step(f"Attack script content preview: {str(context.attack_script)[:500]}...")
+            
+            # Check if strip() method is available for dict
+            if hasattr(context.attack_script, 'strip'):
+                strip_check = context.attack_script.strip()
+            else:
+                strip_check = context.attack_script  # For dict objects
+            
+            context.log_step(f"Strip check result: {bool(strip_check)}")
+            
+            if context.attack_script and strip_check:
+                context.log_step("Executing attack script in sandbox environments...")
+                
+                # Extract script text from LLM response if it's a dict
+                script_text = context.attack_script
+                if isinstance(script_text, dict) and 'response' in script_text:
+                    script_text = script_text['response']
+                    # Extract Python code from markdown if present
+                    if '```python' in script_text:
+                        parts = script_text.split('```python')
+                        if len(parts) > 1:
+                            code_part = parts[1].split('```')[0]
+                            script_text = code_part.strip()
+                
+                context.log_step(f"Script to execute (first 200 chars): {script_text[:200]}...")
+                context.log_step(f"Full script: {len(script_text)} chars")
+                
+                # Initialize sandbox manager with config
+                sandbox_manager = SandboxManager("sandbox_config.json")
+                
+                # Execute in all available sandbox environments
+                context.log_step("Starting sandbox execution...")
+                results = sandbox_manager.execute_in_all_environments(
+                    script_text)
+                context.sandbox_result = results
+                context.log_step("Sandbox execution completed!")
+                context.log_step(f"Results: {results}")
+            else:
+                context.log_step("No attack script to execute in sandbox")
+                context.sandbox_result = "No script generated for sandbox execution"
             
             context.current_state = WorkflowState.SANDBOX_SUCCESS
             context.log_step("Attack executed successfully in sandbox")
@@ -402,9 +449,11 @@ class CyberAttackAgentWrapper:
             "vulnerability_data": final_context.vulnerability_data,
             "attack_script": final_context.attack_script,
             "attack_result": final_context.attack_result,
+            "sandbox_result": final_context.sandbox_result,
+            "attack_instance": final_context.attack_instance,
             "error_message": final_context.error_message,
             "final_state": final_context.current_state.value,
-            "execution_log": final_context.execution_log
+            "steps_log": final_context.execution_log
         }
 
 
