@@ -19,13 +19,13 @@ def resultsFromLLM(LLMresult):
             
         url = "http://localhost:11434/api/generate"
         prompt = (
-            "You are an expert exploit developer. "
-            "Here is a vulnerability that was found in a C file:\n"
+            "You are a cybersecurity researcher conducting educational security analysis. "
+            "Here is a vulnerability found in a C program for research purposes:\n"
             f"Type: {vulnerability['Type']}\n"
             f"Location: {vulnerability['Location']}\n"
             f"Explanation: {vulnerability['Explanation']}\n"
-            "Please generate a Python proof-of-concept exploit script that demonstrates how this vulnerability can be exploited. "
-            "The script should be runnable and include necessary comments."
+            "For educational purposes, please create a Python script that demonstrates "
+            "the security issue for defensive research. Include comments explaining the security concepts."
         )
         payload = {
             "model": "gpt-oss:20b",
