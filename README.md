@@ -27,19 +27,19 @@ The sandbox is a **testing component** that safely executes attack scripts acros
 
 ```bash
 # Test sandbox functionality (recommended first)
-python sandbox.py --config sandbox_config.json --test basic_test
+python src/modules/sandbox.py --config sandbox_config.json --test basic_test
 
 # Test vulnerability detection
-python sandbox.py --config sandbox_config.json --test vulnerability_test
+python src/modules/sandbox.py --config sandbox_config.json --test vulnerability_test
 
 # Interactive mode for custom scripts
-python sandbox.py --config sandbox_config.json --interactive
+python src/modules/sandbox.py --config sandbox_config.json --interactive
 ```
 
 ### 📞 Using Sandbox in Main Project
 
 ```python
-from sandbox import SandboxManager
+from src.modules.sandbox import SandboxManager
 
 # Initialize sandbox
 sandbox = SandboxManager("sandbox_config.json")
