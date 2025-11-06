@@ -43,7 +43,7 @@ if %ERRORLEVEL% neq 0 (
 echo.
 
 echo Testing basic Docker connectivity...
-%DOCKER_CMD% run --rm %IMAGE% python -c "print('Docker Python connection OK')"
+%DOCKER_CMD% run --rm %IMAGE% python3 -c "print('Docker Python connection OK')"
 if %ERRORLEVEL% neq 0 (
     echo ERROR: Failed to run basic Docker test
     exit /b 1
@@ -79,7 +79,7 @@ echo( >> "%TEMP%\docker_test.py"
 echo print("\\nAll Docker verification tests completed!") >> "%TEMP%\docker_test.py"
 
 echo Running comprehensive Docker verification tests...
-%DOCKER_CMD% run --rm -v "%~dp0..\sandbox_config.json:/config/sandbox_config.json" -v "%TEMP%\docker_test.py:/script.py" %IMAGE% python /script.py
+%DOCKER_CMD% run --rm -v "%~dp0..\sandbox_config.json:/config/sandbox_config.json" -v "%TEMP%\docker_test.py:/script.py" %IMAGE% python3 /script.py
 
 if %ERRORLEVEL%==0 (
     echo.
