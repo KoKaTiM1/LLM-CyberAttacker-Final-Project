@@ -21,8 +21,8 @@ from enum import Enum
 # Import existing components
 from .LLM import getFile, sendToLLM, checkConnectionWithOllama, checkAPIconnectionWithAgent
 from .Agent import resultsFromLLM
-from .Factory import Attack_Factory
 from .sandbox import SandboxManager
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -46,9 +46,6 @@ class WorkflowState(Enum):
     CREATING_SCRIPT = "creating_script"
     SCRIPT_SUCCESS = "script_success"
     SCRIPT_FAILED = "script_failed"
-    CREATING_ATTACK_INSTANCE = "creating_attack_instance"
-    ATTACK_INSTANCE_SUCCESS = "attack_instance_success"
-    ATTACK_INSTANCE_FAILED = "attack_instance_failed"
     EXECUTING_IN_SANDBOX = "executing_in_sandbox"
     SANDBOX_SUCCESS = "sandbox_success"
     SANDBOX_FAILED = "sandbox_failed"
@@ -66,7 +63,6 @@ class AgentContext:
         self.vulnerability_data = {}
         self.llm_response = ""          # Raw LLM response
         self.attack_script = ""         # Script from Agent
-        self.attack_instance = None     # Attack instance from Factory
         self.sandbox_result = ""        # Result from Sandbox execution
         self.attack_result = ""         # Result from attack execution
         self.error_message = ""
@@ -183,7 +179,6 @@ class CyberAttackAgentWrapper:
         validate_node = workflow.add_node("validate_file", self.validate_file_step)
         analyze_node = workflow.add_node("analyze_vulnerability", self.analyze_vulnerability_step)
         create_script_node = workflow.add_node("create_attack_script", self.create_attack_script_step)
-        create_instance_node = workflow.add_node("create_attack_instance", self.create_attack_instance_step)
         execute_sandbox_node = workflow.add_node("execute_in_sandbox", self.execute_in_sandbox_step)
         error_node = workflow.add_node("handle_error", self.handle_error_step)
         complete_node = workflow.add_node("workflow_complete", self.workflow_complete_step)
@@ -203,11 +198,8 @@ class CyberAttackAgentWrapper:
         analyze_node.add_conditional_edge("success", "create_attack_script")
         analyze_node.add_conditional_edge("failed", "handle_error")
         
-        create_script_node.add_conditional_edge("success", "create_attack_instance")
+        create_script_node.add_conditional_edge("success", "execute_in_sandbox")
         create_script_node.add_conditional_edge("failed", "handle_error")
-        
-        create_instance_node.add_conditional_edge("success", "execute_in_sandbox")
-        create_instance_node.add_conditional_edge("failed", "handle_error")
         
         execute_sandbox_node.add_conditional_edge("success", "workflow_complete")
         execute_sandbox_node.add_conditional_edge("failed", "handle_error")
@@ -321,217 +313,100 @@ class CyberAttackAgentWrapper:
         
         return context
     
-    def create_attack_instance_step(self, context: AgentContext) -> AgentContext:
-        """Step 5A: Create attack instance based on script"""
-        context.log_step("Step 5A: Creating attack instance...")
-        context.current_state = WorkflowState.CREATING_ATTACK_INSTANCE
-        
-        try:
-            # Extract vulnerability type from parsed vulnerability data
-            vulnerability_data = context.vulnerability_data
-            
-            if 'vulnerabilities' in vulnerability_data and len(vulnerability_data['vulnerabilities']) > 0:
-                vulnerability = vulnerability_data['vulnerabilities'][0]
-                vuln_type = vulnerability.get("Type")  # Use standardized field name
-            else:
-                context.set_error("No vulnerabilities found in data", WorkflowState.ATTACK_INSTANCE_FAILED)
-                return context
-                
-            context.log_step(f"Vulnerability type for Factory: {vuln_type}")
-            
-            # Create attack instance using Factory
-            context.attack_instance = Attack_Factory.create_attack(vuln_type)
-            
-            if context.attack_instance:
-                context.current_state = WorkflowState.ATTACK_INSTANCE_SUCCESS
-                context.log_step("Attack instance created successfully")
-            else:
-                context.set_error("Failed to create attack instance", WorkflowState.ATTACK_INSTANCE_FAILED)
-                
-        except Exception as e:
-            context.set_error(f"Error creating attack instance: {str(e)}", WorkflowState.ATTACK_INSTANCE_FAILED)
-        
-        return context
-    
     def execute_in_sandbox_step(self, context: AgentContext) -> AgentContext:
-        """Step 5B: Execute attack instance in sandbox"""
-        context.log_step("Step 5B: Executing attack in sandbox...")
+        """Step 5: Execute attack script in sandbox environments"""
+        context.log_step("Step 5: Executing attack script in sandbox...")
         context.current_state = WorkflowState.EXECUTING_IN_SANDBOX
         
         try:
-            if not context.attack_instance:
-                context.set_error("No attack instance available for execution", WorkflowState.SANDBOX_FAILED)
+            # Validate attack script exists
+            if not context.attack_script:
+                context.set_error("No attack script available for execution", WorkflowState.SANDBOX_FAILED)
                 return context
             
-            # Execute the attack instance with vulnerability data first
-            vulnerability = context.vulnerability_data.get('vulnerabilities', [{}])[0]
-            context.attack_result = context.attack_instance.execute_attack(vulnerability)
-            context.log_step(f"Attack instance result: {context.attack_result}")
+            context.log_step(f"Attack script ready ({len(context.attack_script)} characters)")
             
-            # Now execute the attack script in actual sandbox environments
-            context.log_step(f"Attack script type: {type(context.attack_script)}")
-            context.log_step(f"Attack script available: {bool(context.attack_script)}")
-            context.log_step(f"Attack script content preview: {str(context.attack_script)[:500]}...")
+            # Load sandbox configuration
+            config_path = Path(__file__).parent.parent / "config" / "sandbox_config.json"
             
-            # Check if strip() method is available for dict
-            if hasattr(context.attack_script, 'strip'):
-                strip_check = context.attack_script.strip()
-            else:
-                strip_check = context.attack_script  # For dict objects
+            if not config_path.exists():
+                context.set_error(f"Sandbox config file not found: {config_path}", WorkflowState.SANDBOX_FAILED)
+                return context
             
-            context.log_step(f"Strip check result: {bool(strip_check)}")
+            # Create SandboxManager with config file (uses load_config internally)
+            context.log_step("Initializing Sandbox Manager...")
+            sandbox_manager = SandboxManager(config_file=str(config_path))
             
-            if context.attack_script and strip_check:
-                # Extract script text from LLM response if it's a dict
-                script_text = context.attack_script
-                if isinstance(script_text, dict) and 'response' in script_text:
-                    script_text = script_text['response']
-                    # Extract Python code from markdown if present
-                    if '```python' in script_text:
-                        parts = script_text.split('```python')
-                        if len(parts) > 1:
-                            code_part = parts[1].split('```')[0]
-                            script_text = code_part.strip()
-                
-                # Check for LLM refusal patterns
-                refusal_patterns = [
-                    "i'm sorry, but i can't help with that",
-                    "i cannot help",
-                    "i can't assist",
-                    "i cannot provide",
-                    "i'm not able to"
-                ]
-                
-                script_lower = script_text.lower()
-                is_refusal = any(pattern in script_lower for pattern in refusal_patterns)
-                
-                if is_refusal:
-                    context.log_step("LLM refused to generate exploit code - using fallback demonstration")
-                    # Create a safe demonstration script based on vulnerability type
-                    script_text = self._create_fallback_demo_script(context.vulnerability_data)
-                    context.log_step("Generated fallback demonstration script")
+            if not sandbox_manager.environments:
+                context.set_error("No sandbox environments enabled in config", WorkflowState.SANDBOX_FAILED)
+                return context
+            
+            enabled_envs = list(sandbox_manager.environments.keys())
+            context.log_step(f"✓ Loaded {len(enabled_envs)} environment(s): {', '.join(enabled_envs)}")
+            
+            # Connect to all environments
+            context.log_step("Connecting to sandbox environments...")
+            if not sandbox_manager.connect_all():
+                context.set_error("Failed to connect to any sandbox environment", WorkflowState.SANDBOX_FAILED)
+                return context
+            
+            context.log_step("✓ Connected to sandbox environments")
+            
+            # Run basic test to verify environments are working
+            context.log_step("Running basic test on all environments...")
+            test_script = "print('Sandbox test successful')"
+            test_results = sandbox_manager.run_test_on_all(test_script)
+            
+            successful_tests = [name for name, result in test_results.items() if result.success]
+            failed_tests = [name for name, result in test_results.items() if not result.success]
+            
+            if not successful_tests:
+                context.set_error(f"All test runs failed. Failed environments: {', '.join(failed_tests)}", WorkflowState.SANDBOX_FAILED)
+                return context
+            
+            context.log_step(f"✓ Test passed in {len(successful_tests)} environment(s)")
+            if failed_tests:
+                context.log_step(f"⚠️ Test failed in: {', '.join(failed_tests)}")
+            
+            # Execute exploit in all connected environments
+            context.log_step("Executing attack script...")
+            results = sandbox_manager.execute_exploit(
+                exploit_script=context.attack_script,
+                vulnerability_data=context.vulnerability_data
+            )
+            
+            # Store results
+            context.sandbox_result = json.dumps(results, indent=2)
+            
+            # Analyze results
+            successful_envs = []
+            failed_envs = []
+            
+            for env_name, result in results.items():
+                analysis = result.get('exploitation_analysis', {})
+                if analysis.get('exploitation_successful', False):
+                    successful_envs.append(env_name)
+                    context.log_step(f"✅ {env_name}: Attack successful!")
                 else:
-                    context.log_step("Executing attack script in sandbox environments...")
-                
-                context.log_step(f"Script to execute (first 200 chars): {script_text[:200]}...")
-                context.log_step(f"Full script: {len(script_text)} chars")
-                
-                # Initialize sandbox manager with config
-                context.log_step("Initializing sandbox manager...")
-                sandbox_manager = SandboxManager("sandbox_config.json")
-                
-                # Check if environments were loaded
-                if not sandbox_manager.environments:
-                    context.log_step("No sandbox environments configured")
-                    context.sandbox_result = {
-                        'status': 'error',
-                        'message': 'No sandbox environments configured',
-                        'timestamp': context.current_state.value
-                    }
-                else:
-                    context.log_step(f"Loaded {len(sandbox_manager.environments)} sandbox environments")
-                    
-                    # Execute in all available sandbox environments
-                context.log_step("Starting sandbox execution...")
-                results = sandbox_manager.execute_exploit(
-                    script_text, context.vulnerability_data)
-                context.sandbox_result = results
-                context.log_step("Sandbox execution completed!")
-                context.log_step(f"Results: {results}")
-                
-                # Check if sandbox execution actually succeeded
-                if results.get('status') == 'error':
-                    error_msg = results.get('message', 'Unknown sandbox error')
-                    context.set_error(f"Sandbox execution failed: {error_msg}", WorkflowState.SANDBOX_FAILED)
-                    return context
-                elif not results.get('exploitation_successful', False) and results.get('environments_tested', 0) == 0:
-                    context.set_error("No sandbox environments were available for testing", WorkflowState.SANDBOX_FAILED)
-                    return context
-            else:
-                context.log_step("No attack script to execute in sandbox")
-                context.sandbox_result = "No script generated for sandbox execution"
+                    failed_envs.append(env_name)
+                    context.log_step(f"❌ {env_name}: Attack failed")
             
-            context.current_state = WorkflowState.SANDBOX_SUCCESS
-            context.log_step("Attack executed successfully in sandbox")
+            # Determine overall success
+            if successful_envs:
+                context.current_state = WorkflowState.SANDBOX_SUCCESS
+                context.log_step(f"✅ Attack succeeded in {len(successful_envs)} environment(s): {', '.join(successful_envs)}")
+            else:
+                context.current_state = WorkflowState.SANDBOX_FAILED
+                context.log_step(f"⚠️ Attack failed in all {len(failed_envs)} environment(s)")
+            
+            # Cleanup
+            sandbox_manager.disconnect_all()
+            context.log_step("Sandbox cleanup completed")
             
         except Exception as e:
-            context.set_error(f"Error executing in sandbox: {str(e)}", WorkflowState.SANDBOX_FAILED)
+            context.set_error(f"Sandbox execution error: {str(e)}", WorkflowState.SANDBOX_FAILED)
         
         return context
-    
-    def _create_fallback_demo_script(self, vulnerability_data: Dict[str, Any]) -> str:
-        """Create a safe demonstration script when LLM refuses to generate exploit code"""
-        vuln_type = "unknown"
-        if 'vulnerabilities' in vulnerability_data and vulnerability_data['vulnerabilities']:
-            vuln_type = vulnerability_data['vulnerabilities'][0].get('Type', 'unknown').lower()
-        
-        if 'buffer overflow' in vuln_type:
-            return '''
-# Educational Buffer Overflow Demonstration
-print("=== Buffer Overflow Vulnerability Analysis ===")
-print("This demonstrates buffer overflow concepts for educational purposes")
-print("")
-print("Buffer overflow occurs when:")
-print("1. A program writes more data to a buffer than it can hold")
-print("2. Adjacent memory locations get overwritten")
-print("3. This can lead to crashes or arbitrary code execution")
-print("")
-print("Example vulnerable C pattern:")
-print("  char buffer[16];")
-print("  strcpy(buffer, user_input);  // No bounds checking!")
-print("")
-print("Mitigation strategies:")
-print("- Use safe functions like strncpy() or strlcpy()")
-print("- Enable stack canaries (-fstack-protector)")
-print("- Use Address Space Layout Randomization (ASLR)")
-print("- Implement input validation")
-print("")
-print("Educational demonstration completed.")
-'''
-        elif 'format string' in vuln_type:
-            return '''
-# Educational Format String Vulnerability Demonstration
-print("=== Format String Vulnerability Analysis ===")
-print("This demonstrates format string concepts for educational purposes")
-print("")
-print("Format string vulnerability occurs when:")
-print("1. User input is passed directly as format string to printf-family functions")
-print("2. Attackers can read from or write to arbitrary memory locations")
-print("3. Example: printf(user_input) instead of printf('%s', user_input)")
-print("")
-print("Example vulnerable C pattern:")
-print("  printf(argv[1]);  // Dangerous!")
-print("  Should be: printf('%s', argv[1]);")
-print("")
-print("Mitigation strategies:")
-print("- Always use format specifiers: printf('%s', input)")
-print("- Enable format string protection (-Wformat-security)")
-print("- Use static analysis tools")
-print("- Input validation and sanitization")
-print("")
-print("Educational demonstration completed.")
-'''
-        else:
-            return f'''
-# Educational Vulnerability Demonstration
-print("=== {vuln_type.title()} Vulnerability Analysis ===")
-print("This is an educational demonstration of vulnerability concepts")
-print("")
-print("Vulnerability type: {vuln_type}")
-print("This type of vulnerability typically involves:")
-print("- Memory safety issues")
-print("- Input validation problems")
-print("- Improper resource handling")
-print("")
-print("General mitigation strategies:")
-print("- Use safe programming practices")
-print("- Enable compiler security features")
-print("- Implement proper input validation")
-print("- Use static and dynamic analysis tools")
-print("- Follow secure coding guidelines")
-print("")
-print("Educational demonstration completed.")
-'''
     
     def handle_error_step(self, context: AgentContext) -> AgentContext:
         """Handle errors that occurred during the workflow"""
@@ -562,11 +437,9 @@ print("Educational demonstration completed.")
             "vulnerability_data": final_context.vulnerability_data,
             "attack_script": final_context.attack_script,
             "attack_result": final_context.attack_result,
-            "sandbox_result": final_context.sandbox_result,
-            "attack_instance": final_context.attack_instance,
             "error_message": final_context.error_message,
             "final_state": final_context.current_state.value,
-            "steps_log": final_context.execution_log
+            "execution_log": final_context.execution_log
         }
 
 
