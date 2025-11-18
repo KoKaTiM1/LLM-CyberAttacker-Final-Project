@@ -25,22 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def sanitize_script_content(script_content: str) -> str:
-    """
-    Clean script content to remove problematic Unicode characters that can cause encoding errors.
-    Converts special Unicode characters (like U+202F narrow no-break space) to ASCII equivalents.
-    
-    Args:
-        script_content: The original script content
-        
-    Returns:
-        Clean ASCII-compatible script content
-    """
-    # Remove all non-ASCII characters by encoding to ASCII and ignoring errors
-    clean_content = script_content.encode('ascii', errors='ignore').decode('ascii')
-    return clean_content
-
-
 def analyze_exploitation_results(output: str, error: str = None, 
                                vulnerability_type: str = None) -> dict:
     """
@@ -90,7 +74,7 @@ def analyze_exploitation_results(output: str, error: str = None,
     }
     
     output_lower = output.lower() if output else ""
-    error_lower = error.lower() if error else ""
+    error_lower = str(error).lower() if error else ""
     combined_text = f"{output_lower} {error_lower}"
     
     # Check for success
@@ -199,17 +183,33 @@ class SandboxEnvironment(ABC):
         pass
     
     @abstractmethod
+    def upload_file(self, local_file_path: str, remote_file_path: str = None) -> bool:
+        """Upload a file to the sandbox environment"""
+        pass
+    
+    @abstractmethod
+    def make_executable(self, file_path: str) -> bool:
+        """Make a file executable in the sandbox"""
+        pass
+    
+    @abstractmethod
+    def execute_against_target(self, attack_script: str, target_file: str, script_type: str = "python") -> TestResult:
+        """Execute attack script against uploaded target file"""
+        pass
+    
+    @abstractmethod
     def check_health(self) -> bool:
         """Check if environment is healthy and ready"""
         pass
 
 
 class DockerContainerEnvironment(SandboxEnvironment):
-    """Docker Container environment implementation"""
+    """Docker Container environment implementation with C and Python support"""
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__("Docker_Container", config)
-        self.image = config.get("image", "python:3.11-slim")
+        # Use gcc image with both Python and gcc for multi-language support
+        self.image = config.get("image", "gcc:latest")
         self.container_name = config.get("container_name", "sandbox-test")
         self.docker_command = config.get("docker_command", "docker")
         self.container_id = None
@@ -274,8 +274,8 @@ class DockerContainerEnvironment(SandboxEnvironment):
             logger.error(f"Docker disconnection error: {e}")
             return False
     
-    def execute_script(self, script_content: str) -> TestResult:
-        """Execute script in Docker container"""
+    def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
+        """Execute script in Docker container with C and Python support"""
         start_time = time.time()
         
         if not self.is_connected:
@@ -288,43 +288,10 @@ class DockerContainerEnvironment(SandboxEnvironment):
             )
         
         try:
-            # Clean script content to remove problematic Unicode characters
-            clean_content = sanitize_script_content(script_content)
-            
-            # Create a temporary file for the script
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='ascii', errors='ignore') as f:
-                f.write(clean_content)
-                temp_script_path = f.name
-            
-            try:
-                # Run the script in a Docker container
-                docker_cmd = [
-                    self.docker_command, "run", "--rm",
-                    "-v", f"{temp_script_path}:/script.py",
-                    self.image,
-                    "python", "/script.py"
-                ]
-                
-                result = subprocess.run(
-                    docker_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                
-                execution_time = time.time() - start_time
-                
-                return TestResult(
-                    environment=self.name,
-                    success=result.returncode == 0,
-                    output=result.stdout,
-                    execution_time=execution_time,
-                    error=result.stderr if result.returncode != 0 else None
-                )
-                
-            finally:
-                # Clean up temporary file
-                os.unlink(temp_script_path)
+            if file_type.lower() == "c":
+                return self._execute_c_script(script_content, start_time)
+            else:
+                return self._execute_python_script(script_content, start_time)
                 
         except Exception as e:
             execution_time = time.time() - start_time
@@ -335,6 +302,82 @@ class DockerContainerEnvironment(SandboxEnvironment):
                 execution_time=execution_time,
                 error=f"Docker execution error: {e}"
             )
+    
+    def _execute_python_script(self, script_content: str, start_time: float) -> TestResult:
+        """Execute Python script in Docker container"""
+        # Create a temporary file for the Python script
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(script_content)
+            temp_script_path = f.name
+        
+        try:
+            # Use Python from gcc container (which has python3)
+            # Create a writable working directory and set proper PATH
+            docker_cmd = [
+                self.docker_command, "run", "--rm",
+                "-v", f"{temp_script_path}:/script.py",
+                "-w", "/tmp",  # Set working directory to writable /tmp
+                self.image,
+                "bash", "-c", "cd /tmp && python3 /script.py"
+            ]
+            
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            execution_time = time.time() - start_time
+            
+            return TestResult(
+                environment=self.name,
+                success=result.returncode == 0,
+                output=result.stdout,
+                execution_time=execution_time,
+                error=result.stderr if result.returncode != 0 else None
+            )
+            
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_script_path)
+    
+    def _execute_c_script(self, script_content: str, start_time: float) -> TestResult:
+        """Execute C script in Docker container with compilation"""
+        # Create a temporary file for the C source code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
+            f.write(script_content)
+            temp_c_path = f.name
+        
+        try:
+            # Use gcc container which has gcc pre-installed
+            docker_cmd = [
+                self.docker_command, "run", "--rm",
+                "-v", f"{temp_c_path}:/program.c",
+                self.image,
+                "bash", "-c", "gcc -o /program /program.c -w && /program"
+            ]
+            
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            execution_time = time.time() - start_time
+            
+            return TestResult(
+                environment=self.name,
+                success=result.returncode == 0,
+                output=result.stdout,
+                execution_time=execution_time,
+                error=result.stderr if result.returncode != 0 else None
+            )
+            
+        finally:
+            # Clean up temporary file
+            os.unlink(temp_c_path)
     
     def check_health(self) -> bool:
         """Check Docker environment health"""
@@ -354,8 +397,169 @@ class DockerContainerEnvironment(SandboxEnvironment):
         except Exception as e:
             logger.error(f"Docker health check error: {e}")
             return False
+    
+    def upload_file(self, local_file_path: str, remote_file_path: str = None) -> bool:
+        """Upload a file to the Docker container"""
+        if not self.is_connected:
+            logger.error("Not connected to Docker environment")
+            return False
+        
+        if not os.path.exists(local_file_path):
+            logger.error(f"Local file not found: {local_file_path}")
+            return False
+        
+        # Use remote path or default to /tmp/uploaded_file
+        if remote_file_path is None:
+            filename = os.path.basename(local_file_path)
+            remote_file_path = f"/tmp/{filename}"
+        
+        try:
+            # For Docker, we'll store file contents and write them during execution
+            # Read the local file content
+            with open(local_file_path, 'r') as f:
+                file_content = f.read()
+            
+            # Store the file content for later use - we'll write it when executing
+            if not hasattr(self, '_uploaded_files'):
+                self._uploaded_files = {}
+            
+            self._uploaded_files[remote_file_path] = file_content
+            
+            logger.info(f"File content cached for Docker: {local_file_path} -> {remote_file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Docker file upload error: {e}")
+            return False
+    
+    def make_executable(self, file_path: str) -> bool:
+        """Make a file executable in Docker container"""
+        if not self.is_connected:
+            logger.error("Not connected to Docker environment")
+            return False
+        
+        try:
+            result = subprocess.run(
+                [self.docker_command, "run", "--rm", "-v", f"{file_path}:{file_path}",
+                 self.image, "chmod", "+x", file_path],
+                capture_output=True, text=True, timeout=30
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"File made executable in Docker: {file_path}")
+                return True
+            else:
+                logger.error(f"Failed to make executable: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Docker make executable error: {e}")
+            return False
+    
+    def execute_against_target(self, attack_script: str, target_file: str,
+                              script_type: str = "python") -> TestResult:
+        """Execute attack script against uploaded target file in Docker"""
+        start_time = time.time()
+        
+        if not self.is_connected:
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=0,
+                error="Not connected to Docker environment"
+            )
+        
+        try:
+            # Create temp file for attack script
+            with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}',
+                                           delete=False) as f:
+                f.write(attack_script)
+                temp_script_path = f.name
+            
+            # Create a comprehensive script that handles file creation and execution
+            wrapper_script = f'''#!/bin/bash
 
+# Create target file if it was uploaded
+if [ -n "$TARGET_FILE_CONTENT" ]; then
+    echo "Creating target file: {target_file}"
+    echo "$TARGET_FILE_CONTENT" > {target_file}
+    chmod +x {target_file} 2>/dev/null || true
+fi
 
+# Execute the attack script
+if [ "{script_type}" = "python" ]; then
+    python3 /attack.{script_type} {target_file}
+elif [ "{script_type}" = "c" ]; then
+    gcc /attack.{script_type} -o /tmp/attack_binary -w && /tmp/attack_binary {target_file}
+else
+    chmod +x /attack.{script_type} && /attack.{script_type} {target_file}
+fi
+'''
+            
+            # Create wrapper script file with Unix line endings
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.sh', delete=False, newline='\n'
+            ) as f:
+                f.write(wrapper_script)
+                wrapper_path = f.name
+            
+            # Prepare environment variables
+            env_vars = []
+            if hasattr(self, '_uploaded_files') and target_file in self._uploaded_files:
+                env_vars.extend(["-e", f"TARGET_FILE_CONTENT={self._uploaded_files[target_file]}"])
+            
+            # Execute in Docker with mounted files
+            docker_cmd = [
+                self.docker_command, "run", "--rm",
+                "-v", f"{temp_script_path}:/attack.{script_type}",
+                "-v", f"{wrapper_path}:/wrapper.sh",
+                "-w", "/tmp"
+            ] + env_vars + [
+                self.image,
+                "bash", "/wrapper.sh"
+            ]
+            
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120  # Longer timeout for complex attacks
+            )
+            
+            execution_time = time.time() - start_time
+            
+            # Clean up temp files
+            try:
+                os.unlink(temp_script_path)
+                os.unlink(wrapper_path)
+            except:
+                pass
+            
+            return TestResult(
+                environment=self.name,
+                success=result.returncode == 0,
+                output=result.stdout,
+                execution_time=execution_time,
+                error=result.stderr if result.returncode != 0 else None
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            # Clean up temp files
+            try:
+                os.unlink(temp_script_path)
+                os.unlink(wrapper_path)
+            except:
+                pass
+            
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"Docker attack execution error: {e}"
+            )
 class E2BAPIEnvironment(SandboxEnvironment):
     """E2B API environment implementation using SDK"""
     
@@ -405,8 +609,8 @@ class E2BAPIEnvironment(SandboxEnvironment):
             logger.error(f"E2B API disconnection error: {e}")
             return False
     
-    def execute_script(self, script_content: str) -> TestResult:
-        """Execute script in E2B API"""
+    def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
+        """Execute script in E2B API with Python wrapper for C code"""
         start_time = time.time()
         
         if not self.is_connected or not self.sandbox:
@@ -419,11 +623,13 @@ class E2BAPIEnvironment(SandboxEnvironment):
             )
         
         try:
-            # Clean script content to remove problematic Unicode characters
-            clean_content = sanitize_script_content(script_content)
-            
-            # Execute the script using E2B SDK
-            execution = self.sandbox.run_code(clean_content, timeout=30)
+            if file_type.lower() == "c":
+                # Create Python wrapper for C code
+                python_wrapper = self._create_c_wrapper(script_content)
+                execution = self.sandbox.run_code(python_wrapper, timeout=30)
+            else:
+                # Execute Python code directly
+                execution = self.sandbox.run_code(script_content, timeout=30)
             
             execution_time = time.time() - start_time
             
@@ -463,6 +669,66 @@ class E2BAPIEnvironment(SandboxEnvironment):
                 error=f"E2B API execution error: {e}"
             )
     
+    def _create_c_wrapper(self, c_code: str) -> str:
+        """Create Python wrapper to compile and execute C code in E2B"""
+        python_wrapper = f'''
+import subprocess
+import tempfile
+import os
+
+# C source code to compile and execute
+c_source = """{c_code}"""
+
+try:
+    # Create temporary C file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
+        f.write(c_source)
+        c_file_path = f.name
+    
+    # Compile the C program
+    binary_path = c_file_path.replace('.c', '')
+    compile_result = subprocess.run(
+        ['gcc', '-o', binary_path, c_file_path, '-w'],
+        capture_output=True,
+        text=True
+    )
+    
+    if compile_result.returncode != 0:
+        print(f"C Compilation Error: {{compile_result.stderr}}")
+    else:
+        print("C compilation successful")
+        
+        # Execute the compiled program
+        exec_result = subprocess.run(
+            [binary_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if exec_result.stdout:
+            print(f"Program Output: {{exec_result.stdout}}")
+        if exec_result.stderr:
+            print(f"Program Error: {{exec_result.stderr}}")
+        if exec_result.returncode == 0:
+            print("C program executed successfully")
+        else:
+            print(f"C program failed with return code: {{exec_result.returncode}}")
+    
+except Exception as e:
+    print(f"Python wrapper error: {{e}}")
+finally:
+    # Clean up temporary files
+    try:
+        if 'c_file_path' in locals():
+            os.unlink(c_file_path)
+        if 'binary_path' in locals() and os.path.exists(binary_path):
+            os.unlink(binary_path)
+    except:
+        pass
+'''
+        return python_wrapper
+    
     def check_health(self) -> bool:
         """Check E2B API health"""
         if not self.is_connected or not self.sandbox:
@@ -476,6 +742,171 @@ class E2BAPIEnvironment(SandboxEnvironment):
         except Exception as e:
             logger.error(f"E2B API health check error: {e}")
             return False
+    
+    def upload_file(self, local_file_path: str, remote_file_path: str = None) -> bool:
+        """Upload a file to E2B sandbox"""
+        if not self.is_connected or not self.sandbox:
+            logger.error("Not connected to E2B environment")
+            return False
+        
+        if not os.path.exists(local_file_path):
+            logger.error(f"Local file not found: {local_file_path}")
+            return False
+        
+        try:
+            with open(local_file_path, 'r') as f:
+                content = f.read()
+            
+            # Use remote path or default to filename
+            if remote_file_path is None:
+                remote_file_path = os.path.basename(local_file_path)
+            
+            # Write file content to E2B sandbox using safe string escaping
+            import json
+            escaped_content = json.dumps(content)
+            
+            result = self.sandbox.run_code(f"""
+import json
+content = json.loads({escaped_content!r})
+with open('{remote_file_path}', 'w') as f:
+    f.write(content)
+print(f"File uploaded: {remote_file_path}")
+""", timeout=30)
+            
+            if not result.error:
+                logger.info(f"File uploaded to E2B: {local_file_path} -> {remote_file_path}")
+                return True
+            else:
+                logger.error(f"E2B upload error: {result.error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"E2B file upload error: {e}")
+            return False
+    
+    def make_executable(self, file_path: str) -> bool:
+        """Make a file executable in E2B sandbox"""
+        if not self.is_connected or not self.sandbox:
+            logger.error("Not connected to E2B environment")
+            return False
+        
+        try:
+            result = self.sandbox.run_code(f"""
+import os
+import stat
+os.chmod('{file_path}', stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+print(f"File made executable: {file_path}")
+""", timeout=10)
+            
+            if not result.error:
+                logger.info(f"File made executable in E2B: {file_path}")
+                return True
+            else:
+                logger.error(f"E2B make executable error: {result.error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"E2B make executable error: {e}")
+            return False
+    
+    def _extract_output(self, result):
+        """Extract output from E2B result object with various formats"""
+        try:
+            # Try multiple ways to get output from E2B result
+            if hasattr(result, 'stdout'):
+                output = result.stdout
+                if hasattr(result, 'stderr') and result.stderr:
+                    output += f"\nSTDERR: {result.stderr}"
+                return output
+            elif hasattr(result, 'logs'):
+                # Newer E2B API with logs
+                output = ""
+                for log in result.logs:
+                    if hasattr(log, 'line'):
+                        output += log.line + "\n"
+                    elif hasattr(log, 'content'):
+                        output += log.content + "\n"
+                    else:
+                        output += str(log) + "\n"
+                return output.strip()
+            elif hasattr(result, 'output'):
+                return str(result.output)
+            else:
+                # Fallback - convert entire result to string
+                return str(result)
+        except Exception:
+            return str(result)
+    
+    def execute_against_target(self, attack_script: str, target_file: str, 
+                              script_type: str = "python") -> TestResult:
+        """Execute attack script against target file in E2B"""
+        start_time = time.time()
+        
+        if not self.is_connected or not self.sandbox:
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=0,
+                error="Not connected to E2B environment"
+            )
+        
+        try:
+            if script_type.lower() == "python":
+                # Execute Python attack script with target file argument
+                full_script = f"""
+import sys
+import os
+
+# Set up target file and arguments
+target_file = '{target_file}'
+sys.argv = ['attack.py', target_file]
+
+# Attack script:
+{attack_script}
+"""
+            else:
+                # For non-Python scripts, save and execute via shell
+                full_script = f"""
+import subprocess
+import os
+import sys
+
+# Save attack script
+with open('/tmp/attack_script', 'w') as f:
+    f.write('''{attack_script}''')
+
+# Make it executable
+os.chmod('/tmp/attack_script', 0o755)
+
+# Execute against target
+result = subprocess.run(['/tmp/attack_script', '{target_file}'], 
+                       capture_output=True, text=True, timeout=60)
+print(result.stdout)
+if result.stderr:
+    print(f"Error: {{result.stderr}}", file=sys.stderr)
+"""
+            
+            result = self.sandbox.run_code(full_script, timeout=120)
+            execution_time = time.time() - start_time
+            
+            return TestResult(
+                environment=self.name,
+                success=not result.error,
+                output=self._extract_output(result),
+                execution_time=execution_time,
+                error=result.error if result.error else None
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"E2B attack execution error: {e}"
+            )
 
 
 class VirtualBoxEnvironment(SandboxEnvironment):
@@ -544,8 +975,13 @@ class VirtualBoxEnvironment(SandboxEnvironment):
     
     def disconnect(self) -> bool:
         """Disconnect from VirtualBox VM"""
+        if not self.is_connected:
+            return True
+            
         try:
-            # Shutdown the VM gracefully
+            logger.info(f"Initiating graceful shutdown of VM: {self.vm_name}")
+            
+            # Try graceful shutdown first
             result = subprocess.run(
                 [self.vboxmanage_path, "controlvm", self.vm_name, "acpipowerbutton"],
                 capture_output=True,
@@ -553,12 +989,16 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 timeout=30
             )
             
-            if result.returncode == 0:
-                # Wait a bit for graceful shutdown
-                logger.info(f"Initiating graceful shutdown of VM: {self.vm_name}")
-                time.sleep(10)
+            # Wait for graceful shutdown (regardless of command result)
+            max_wait_time = 15  # seconds
+            wait_interval = 2   # seconds
+            waited = 0
+            
+            while waited < max_wait_time:
+                time.sleep(wait_interval)
+                waited += wait_interval
                 
-                # Check if VM is still running, force shutdown if needed
+                # Check if VM is still running
                 check_result = subprocess.run(
                     [self.vboxmanage_path, "showvminfo", self.vm_name, "--machinereadable"],
                     capture_output=True,
@@ -566,14 +1006,30 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                     timeout=10
                 )
                 
-                if check_result.returncode == 0 and "VMState=\"running\"" in check_result.stdout:
-                    logger.info("VM still running, forcing poweroff...")
-                    subprocess.run(
-                        [self.vboxmanage_path, "controlvm", self.vm_name, "poweroff"],
-                        capture_output=True,
-                        text=True,
-                        timeout=15
-                    )
+                if check_result.returncode == 0:
+                    if "VMState=\"running\"" not in check_result.stdout:
+                        logger.info(f"VM {self.vm_name} shut down gracefully")
+                        self.is_connected = False
+                        return True
+                else:
+                    # VM might already be stopped
+                    logger.info(f"VM {self.vm_name} appears to be stopped")
+                    self.is_connected = False
+                    return True
+            
+            # If we get here, graceful shutdown failed - force poweroff
+            logger.warning(f"Graceful shutdown timed out, forcing poweroff of VM: {self.vm_name}")
+            poweroff_result = subprocess.run(
+                [self.vboxmanage_path, "controlvm", self.vm_name, "poweroff"],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            if poweroff_result.returncode == 0:
+                logger.info(f"Successfully forced shutdown of VM: {self.vm_name}")
+            else:
+                logger.warning(f"Poweroff command failed, but proceeding anyway: {poweroff_result.stderr}")
             
             self.is_connected = False
             logger.info(f"Disconnected from VirtualBox VM: {self.vm_name}")
@@ -581,10 +1037,12 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             
         except Exception as e:
             logger.error(f"VirtualBox disconnection error: {e}")
+            # Even if there's an error, mark as disconnected to prevent hanging
+            self.is_connected = False
             return False
     
-    def execute_script(self, script_content: str) -> TestResult:
-        """Execute script in VirtualBox VM"""
+    def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
+        """Execute script in VirtualBox VM with C and Python support"""
         start_time = time.time()
         
         if not self.is_connected:
@@ -597,72 +1055,11 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             )
         
         try:
-            # Clean script content to remove problematic Unicode characters
-            clean_content = sanitize_script_content(script_content)
-            
-            # Create a temporary script file path in the VM
-            script_file = "/tmp/sandbox_script.py"
-            
-            # Create a temporary file on the host system first
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='ascii', errors='ignore') as temp_file:
-                temp_file.write(clean_content)
-                temp_host_file = temp_file.name
-            
-            try:
-                # Copy script from host to VM using guestcontrol
-                copy_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "copyto", "--username", self.username, "--password", self.password,
-                    temp_host_file, script_file
-                ]
+            if file_type.lower() == "c":
+                return self._execute_c_script_vm(script_content, start_time)
+            else:
+                return self._execute_python_script_vm(script_content, start_time)
                 
-                copy_result = subprocess.run(
-                    copy_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-            finally:
-                # Clean up temporary host file
-                try:
-                    os.unlink(temp_host_file)
-                except Exception:
-                    pass
-            
-            if copy_result.returncode != 0:
-                execution_time = time.time() - start_time
-                return TestResult(
-                    environment=self.name,
-                    success=False,
-                    output="",
-                    execution_time=execution_time,
-                    error=f"Failed to copy script to VM: {copy_result.stderr}"
-                )
-            
-            # Execute script in VM
-            exec_cmd = [
-                self.vboxmanage_path, "guestcontrol", self.vm_name,
-                "run", "--username", self.username, "--password", self.password,
-                "--exe", self.python_path, "--", script_file
-            ]
-            
-            exec_result = subprocess.run(
-                exec_cmd,
-                capture_output=True,
-                text=True,
-                timeout=60
-            )
-            
-            execution_time = time.time() - start_time
-            
-            return TestResult(
-                environment=self.name,
-                success=exec_result.returncode == 0,
-                output=exec_result.stdout,
-                execution_time=execution_time,
-                error=exec_result.stderr if exec_result.returncode != 0 else None
-            )
-            
         except Exception as e:
             execution_time = time.time() - start_time
             return TestResult(
@@ -672,6 +1069,161 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 execution_time=execution_time,
                 error=f"VirtualBox execution error: {e}"
             )
+    
+    def _execute_python_script_vm(self, script_content: str, start_time: float) -> TestResult:
+        """Execute Python script in VirtualBox VM"""
+        # Create a temporary script file path in the VM
+        script_file = "/tmp/sandbox_script.py"
+        
+        # Create a temporary file on the host system first
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+            temp_file.write(script_content)
+            temp_host_file = temp_file.name
+        
+        try:
+            # Copy script from host to VM using guestcontrol
+            copy_cmd = [
+                self.vboxmanage_path, "guestcontrol", self.vm_name,
+                "copyto", "--username", self.username, "--password", self.password,
+                temp_host_file, script_file
+            ]
+            
+            copy_result = subprocess.run(
+                copy_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        finally:
+            # Clean up temporary host file
+            try:
+                os.unlink(temp_host_file)
+            except Exception:
+                pass
+        
+        if copy_result.returncode != 0:
+            execution_time = time.time() - start_time
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"Failed to copy script to VM: {copy_result.stderr}"
+            )
+        
+        # Execute script in VM
+        exec_cmd = [
+            self.vboxmanage_path, "guestcontrol", self.vm_name,
+            "run", "--username", self.username, "--password", self.password,
+            "--exe", self.python_path, "--", script_file
+        ]
+        
+        exec_result = subprocess.run(
+            exec_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        execution_time = time.time() - start_time
+        
+        return TestResult(
+            environment=self.name,
+            success=exec_result.returncode == 0,
+            output=exec_result.stdout,
+            execution_time=execution_time,
+            error=exec_result.stderr if exec_result.returncode != 0 else None
+        )
+    
+    def _execute_c_script_vm(self, script_content: str, start_time: float) -> TestResult:
+        """Execute C script in VirtualBox VM with compilation"""
+        # Create temporary file paths in the VM
+        c_file = "/tmp/sandbox_script.c"
+        binary_file = "/tmp/sandbox_program"
+        
+        # Create a temporary file on the host system first
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as temp_file:
+            temp_file.write(script_content)
+            temp_host_file = temp_file.name
+        
+        try:
+            # Copy C source from host to VM
+            copy_cmd = [
+                self.vboxmanage_path, "guestcontrol", self.vm_name,
+                "copyto", "--username", self.username, "--password", self.password,
+                temp_host_file, c_file
+            ]
+            
+            copy_result = subprocess.run(
+                copy_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+        finally:
+            # Clean up temporary host file
+            try:
+                os.unlink(temp_host_file)
+            except Exception:
+                pass
+        
+        if copy_result.returncode != 0:
+            execution_time = time.time() - start_time
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"Failed to copy C file to VM: {copy_result.stderr}"
+            )
+        
+        # Compile C program in VM
+        compile_cmd = [
+            self.vboxmanage_path, "guestcontrol", self.vm_name,
+            "run", "--username", self.username, "--password", self.password,
+            "--exe", "/usr/bin/gcc", "--", "-o", binary_file, c_file, "-w"
+        ]
+        
+        compile_result = subprocess.run(
+            compile_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if compile_result.returncode != 0:
+            execution_time = time.time() - start_time
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"C compilation failed: {compile_result.stderr}"
+            )
+        
+        # Execute compiled program in VM
+        exec_cmd = [
+            self.vboxmanage_path, "guestcontrol", self.vm_name,
+            "run", "--username", self.username, "--password", self.password,
+            "--exe", binary_file
+        ]
+        
+        exec_result = subprocess.run(
+            exec_cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        execution_time = time.time() - start_time
+        
+        return TestResult(
+            environment=self.name,
+            success=exec_result.returncode == 0,
+            output=exec_result.stdout,
+            execution_time=execution_time,
+            error=exec_result.stderr if exec_result.returncode != 0 else None
+        )
     
     def check_health(self) -> bool:
         """Check VirtualBox VM health"""
@@ -709,6 +1261,208 @@ class VirtualBoxEnvironment(SandboxEnvironment):
         except Exception as e:
             logger.error(f"VirtualBox health check error: {e}")
             return False
+    
+    def upload_file(self, local_file_path: str, remote_file_path: str = None) -> bool:
+        """Upload a file to VirtualBox VM"""
+        if not self.is_connected:
+            logger.error("Not connected to VirtualBox environment")
+            return False
+        
+        if not os.path.exists(local_file_path):
+            logger.error(f"Local file not found: {local_file_path}")
+            return False
+        
+        # Use remote path or default to /tmp/filename
+        if remote_file_path is None:
+            filename = os.path.basename(local_file_path)
+            remote_file_path = f"/tmp/{filename}"
+        
+        try:
+            # Copy file to VM using guestcontrol
+            copy_cmd = [
+                self.vboxmanage_path, "guestcontrol", self.vm_name,
+                "copyto", "--username", self.username, "--password", self.password,
+                local_file_path, remote_file_path
+            ]
+            
+            result = subprocess.run(
+                copy_cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"File uploaded to VirtualBox: {local_file_path} -> {remote_file_path}")
+                return True
+            else:
+                logger.error(f"VirtualBox upload error: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"VirtualBox file upload error: {e}")
+            return False
+    
+    def make_executable(self, file_path: str) -> bool:
+        """Make a file executable in VirtualBox VM"""
+        if not self.is_connected:
+            logger.error("Not connected to VirtualBox environment")
+            return False
+        
+        try:
+            chmod_cmd = [
+                self.vboxmanage_path, "guestcontrol", self.vm_name,
+                "run", "--username", self.username, "--password", self.password,
+                "--exe", "/bin/chmod", "--", "+x", file_path
+            ]
+            
+            result = subprocess.run(
+                chmod_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"File made executable in VirtualBox: {file_path}")
+                return True
+            else:
+                logger.error(f"VirtualBox make executable error: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"VirtualBox make executable error: {e}")
+            return False
+    
+    def execute_against_target(self, attack_script: str, target_file: str, 
+                              script_type: str = "python") -> TestResult:
+        """Execute attack script against target file in VirtualBox VM"""
+        start_time = time.time()
+        
+        if not self.is_connected:
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=0,
+                error="Not connected to VirtualBox environment"
+            )
+        
+        try:
+            # Create temporary script file on host
+            with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}', 
+                                           delete=False) as f:
+                f.write(attack_script)
+                temp_script_path = f.name
+            
+            script_file_vm = f"/tmp/attack_script.{script_type}"
+            
+            # Copy attack script to VM
+            copy_cmd = [
+                self.vboxmanage_path, "guestcontrol", self.vm_name,
+                "copyto", "--username", self.username, "--password", self.password,
+                temp_script_path, script_file_vm
+            ]
+            
+            copy_result = subprocess.run(
+                copy_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            # Clean up temp file
+            try:
+                os.unlink(temp_script_path)
+            except:
+                pass
+            
+            if copy_result.returncode != 0:
+                execution_time = time.time() - start_time
+                return TestResult(
+                    environment=self.name,
+                    success=False,
+                    output="",
+                    execution_time=execution_time,
+                    error=f"Failed to copy attack script to VM: {copy_result.stderr}"
+                )
+            
+            # Execute attack script based on type
+            if script_type.lower() == "python":
+                exec_cmd = [
+                    self.vboxmanage_path, "guestcontrol", self.vm_name,
+                    "run", "--username", self.username, "--password", self.password,
+                    "--exe", "/usr/bin/python3", "--", script_file_vm, target_file
+                ]
+            elif script_type.lower() == "c":
+                # Compile and execute C script
+                binary_file = "/tmp/attack_binary"
+                
+                # First compile
+                compile_cmd = [
+                    self.vboxmanage_path, "guestcontrol", self.vm_name,
+                    "run", "--username", self.username, "--password", self.password,
+                    "--exe", "/usr/bin/gcc", "--", script_file_vm, "-o", binary_file, "-w"
+                ]
+                
+                compile_result = subprocess.run(
+                    compile_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                
+                if compile_result.returncode != 0:
+                    execution_time = time.time() - start_time
+                    return TestResult(
+                        environment=self.name,
+                        success=False,
+                        output="",
+                        execution_time=execution_time,
+                        error=f"C compilation failed: {compile_result.stderr}"
+                    )
+                
+                # Then execute
+                exec_cmd = [
+                    self.vboxmanage_path, "guestcontrol", self.vm_name,
+                    "run", "--username", self.username, "--password", self.password,
+                    "--exe", binary_file, "--", target_file
+                ]
+            else:
+                # For shell scripts
+                exec_cmd = [
+                    self.vboxmanage_path, "guestcontrol", self.vm_name,
+                    "run", "--username", self.username, "--password", self.password,
+                    "--exe", "/bin/sh", "--", script_file_vm, target_file
+                ]
+            
+            # Execute the attack
+            exec_result = subprocess.run(
+                exec_cmd,
+                capture_output=True,
+                text=True,
+                timeout=120  # Longer timeout for complex attacks
+            )
+            
+            execution_time = time.time() - start_time
+            
+            return TestResult(
+                environment=self.name,
+                success=exec_result.returncode == 0,
+                output=exec_result.stdout,
+                execution_time=execution_time,
+                error=exec_result.stderr if exec_result.returncode != 0 else None
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return TestResult(
+                environment=self.name,
+                success=False,
+                output="",
+                execution_time=execution_time,
+                error=f"VirtualBox attack execution error: {e}"
+            )
 
 
 class SandboxManager:
@@ -798,17 +1552,22 @@ class SandboxManager:
                 success = False
         return success
     
-    def run_test_on_all(self, script_content: str) -> Dict[str, TestResult]:
-        """Run test script on all connected environments"""
+    def run_test_on_all(self, script_content: str, file_type: str = "python") -> Dict[str, TestResult]:
+        """Run test script on all connected environments with language detection"""
         results = {}
+        
+        # Auto-detect file type if not specified
+        if file_type == "python" and self._is_c_code(script_content):
+            file_type = "c"
+            logger.info(f"Auto-detected file type: {file_type}")
         
         for name, env in self.environments.items():
             if not env.is_connected:
                 logger.warning(f"Environment {name} is not connected, skipping")
                 continue
             
-            logger.info(f"Running test on {name}")
-            result = env.execute_script(script_content)
+            logger.info(f"Running {file_type} script on {name}")
+            result = env.execute_script(script_content, file_type)
             results[name] = result
             self.test_results.append(result)
             
@@ -818,6 +1577,48 @@ class SandboxManager:
                 logger.error(f"{name} - Error: {result.error}")
         
         return results
+    
+    def _is_c_code(self, script_content: str) -> bool:
+        """Enhanced heuristic to detect if script content is C code vs Python"""
+        # Strong Python indicators that override C detection
+        python_indicators = [
+            '#!/usr/bin/env python',
+            'import ',
+            'from ',
+            'def ',
+            'class ',
+            '"""',
+            "'''",
+            'if __name__ == "__main__":'
+        ]
+        
+        # C-specific indicators
+        c_indicators = [
+            '#include <',
+            'int main(',
+            'void main(',
+            'printf(',
+            'scanf(',
+            'malloc(',
+            'free(',
+            'strcpy('
+        ]
+        
+        content_lower = script_content.lower()
+        
+        # Check for Python indicators first - if found, it's definitely Python
+        if any(indicator.lower() in content_lower for indicator in python_indicators):
+            logger.debug("Detected Python script based on Python-specific indicators")
+            return False
+            
+        # Only check for C indicators if no Python indicators found
+        is_c = any(indicator.lower() in content_lower for indicator in c_indicators)
+        if is_c:
+            logger.debug("Detected C code based on C-specific indicators")
+        else:
+            logger.debug("No clear language indicators found, defaulting to Python")
+            
+        return is_c
     
     def execute_exploit(self, exploit_script: str, 
                        vulnerability_data: dict = None) -> dict:
@@ -841,8 +1642,10 @@ class SandboxManager:
         
         logger.info("=== EXECUTING EXPLOIT IN SANDBOX ===")
         
-        # Execute exploit on all environments
-        results = self.run_test_on_all(exploit_script)
+        # Auto-detect file type and execute exploit on all environments
+        file_type = "c" if self._is_c_code(exploit_script) else "python"
+        logger.info(f"Detected script type: {file_type}")
+        results = self.run_test_on_all(exploit_script, file_type)
         
         # Analyze results with intelligence
         detailed_results = {}
@@ -935,8 +1738,8 @@ class SandboxManager:
         unique_suggestions = list(set(all_suggestions))
         return unique_suggestions[:5]
     
-    def run_test_on_environment(self, env_name: str, script_content: str) -> Optional[TestResult]:
-        """Run test script on a specific environment"""
+    def run_test_on_environment(self, env_name: str, script_content: str, file_type: str = "python") -> Optional[TestResult]:
+        """Run test script on a specific environment with language support"""
         if env_name not in self.environments:
             logger.error(f"Environment {env_name} not found")
             return None
@@ -946,8 +1749,12 @@ class SandboxManager:
             logger.error(f"Environment {env_name} is not connected")
             return None
         
-        logger.info(f"Running test on {env_name}")
-        result = env.execute_script(script_content)
+        # Auto-detect file type if not specified
+        if file_type == "python" and self._is_c_code(script_content):
+            file_type = "c"
+        
+        logger.info(f"Running {file_type} test on {env_name}")
+        result = env.execute_script(script_content, file_type)
         self.test_results.append(result)
         
         status_msg = f"{env_name} - Success: {result.success}, Time: {result.execution_time:.2f}s"
@@ -994,6 +1801,167 @@ class SandboxManager:
     def list_environments(self) -> List[str]:
         """Get list of available environments"""
         return list(self.environments.keys())
+    
+    def upload_vulnerable_file(self, local_file_path: str, remote_file_path: str = None) -> Dict[str, bool]:
+        """Upload vulnerable file to all connected environments"""
+        results = {}
+        
+        if not os.path.exists(local_file_path):
+            logger.error(f"Local file not found: {local_file_path}")
+            return {env_name: False for env_name in self.environments.keys()}
+        
+        for name, env in self.environments.items():
+            if not env.is_connected:
+                logger.warning(f"Environment {name} is not connected, skipping upload")
+                results[name] = False
+                continue
+                
+            logger.info(f"Uploading file to {name}...")
+            success = env.upload_file(local_file_path, remote_file_path)
+            results[name] = success
+            
+            if success:
+                logger.info(f"Successfully uploaded to {name}")
+                # Make file executable if it's a binary or script
+                file_ext = os.path.splitext(local_file_path)[1].lower()
+                if file_ext in ['.c', '.cpp', '.sh', '.py', ''] or not file_ext:
+                    env.make_executable(remote_file_path or f"/tmp/{os.path.basename(local_file_path)}")
+            else:
+                logger.error(f"Failed to upload to {name}")
+        
+        return results
+    
+    def generate_and_execute_attack(self, vulnerable_file_path: str, 
+                                   attack_script: str, 
+                                   script_type: str = "python",
+                                   vulnerability_data: dict = None) -> dict:
+        """
+        Generate attack script and execute against uploaded vulnerable file.
+        This is the main method for Agent to use.
+        """
+        # Create logs directory
+        os.makedirs('logs', exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Connect to environments if not already connected
+        if not any(env.is_connected for env in self.environments.values()):
+            logger.info("Connecting to sandbox environments...")
+            if not self.connect_all():
+                return {
+                    'status': 'error',
+                    'message': 'Failed to connect to sandbox environments',
+                    'timestamp': timestamp
+                }
+        
+        logger.info("=== EXECUTING ATTACK AGAINST TARGET FILE ===")
+        logger.info(f"Target file: {vulnerable_file_path}")
+        logger.info(f"Attack script type: {script_type}")
+        
+        # Execute attack on all environments
+        results = {}
+        exploitation_successful = False
+        
+        for env_name, env in self.environments.items():
+            if not env.is_connected:
+                logger.warning(f"Environment {env_name} is not connected, skipping")
+                continue
+            
+            logger.info(f"Executing attack on {env_name}")
+            result = env.execute_against_target(attack_script, vulnerable_file_path, script_type)
+            results[env_name] = result
+            self.test_results.append(result)
+            
+            # Analyze results with intelligence
+            vulnerability_type = None
+            if vulnerability_data:
+                vulnerability_type = vulnerability_data.get('Type', '').lower()
+            
+            analysis = analyze_exploitation_results(
+                output=result.output,
+                error=result.error,
+                vulnerability_type=vulnerability_type
+            )
+            
+            # Check if any environment had successful exploitation
+            if analysis["exploitation_successful"]:
+                exploitation_successful = True
+            
+            # Log analysis results
+            if analysis["exploitation_successful"]:
+                logger.info(f"{env_name}: ATTACK SUCCESSFUL!")
+                if analysis["success_indicators"]:
+                    logger.info(f"Success indicators: {analysis['success_indicators']}")
+            else:
+                logger.warning(f"{env_name}: Attack failed or unclear result")
+                if analysis.get("failure_indicators"):
+                    logger.info(f"Failure reasons: {analysis['failure_indicators']}")
+                if analysis.get("learning_categories"):
+                    logger.info(f"Learning feedback: {analysis['learning_categories']}")
+        
+        # Prepare comprehensive result
+        final_result = {
+            'status': 'success' if exploitation_successful else 'failed',
+            'exploitation_successful': exploitation_successful,
+            'timestamp': timestamp,
+            'target_file': vulnerable_file_path,
+            'attack_type': script_type,
+            'environment_results': {},
+            'learning_insights': [],
+            'recommendations': []
+        }
+        
+        # Process each environment result
+        for env_name, result in results.items():
+            vulnerability_type = None
+            if vulnerability_data:
+                vulnerability_type = vulnerability_data.get('Type', '').lower()
+                
+            analysis = analyze_exploitation_results(
+                output=result.output,
+                error=result.error,
+                vulnerability_type=vulnerability_type
+            )
+            
+            final_result['environment_results'][env_name] = {
+                'success': result.success,
+                'output': result.output,
+                'error': result.error,
+                'execution_time': result.execution_time,
+                'exploitation_successful': analysis["exploitation_successful"],
+                'analysis': analysis
+            }
+            
+            # Collect learning insights
+            if analysis.get("learning_categories"):
+                final_result['learning_insights'].extend(analysis["learning_categories"])
+            
+            if analysis.get("suggestions"):
+                final_result['recommendations'].extend(analysis["suggestions"])
+        
+        # Log to file for LangGraph learning
+        log_file = f'logs/attack_{timestamp}.json'
+        try:
+            with open(log_file, 'w') as f:
+                json.dump(final_result, f, indent=2)
+            logger.info(f"Attack results logged to: {log_file}")
+        except Exception as e:
+            logger.error(f"Failed to save attack log: {e}")
+        
+        # Print summary
+        if exploitation_successful:
+            logger.info("=== ATTACK SUMMARY: SUCCESS ===")
+            successful_envs = [name for name, data in final_result['environment_results'].items() 
+                             if data['exploitation_successful']]
+            logger.info(f"Successful environments: {', '.join(successful_envs)}")
+        else:
+            logger.info("=== ATTACK SUMMARY: FAILED ===")
+            logger.info("No environment showed clear signs of successful exploitation")
+            if final_result['learning_insights']:
+                logger.info("Learning insights for improvement:")
+                for insight in set(final_result['learning_insights']):
+                    logger.info(f"  - {insight}")
+        
+        return final_result
 
 
 def interactive_mode(sandbox: SandboxManager):

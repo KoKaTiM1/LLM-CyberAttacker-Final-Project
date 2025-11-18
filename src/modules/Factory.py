@@ -63,6 +63,9 @@ class Attack_Factory:
     # Registry mapping vulnerability types to attack classes
     _attack_registry = {
         "buffer overflow": Buffer_Overflow_Attack,
+        "buffer overflow via unsafe use of strcpy": Buffer_Overflow_Attack,
+        "buffer overflow via unsafe copy": Buffer_Overflow_Attack,  # ADD THIS NEW ONE
+        "buffer overflow via strcpy": Buffer_Overflow_Attack,
         "format string": Format_String_Attack,
         "use after free": Use_After_Free_Attack,
     }
@@ -71,15 +74,38 @@ class Attack_Factory:
     def create_attack(cls, vulnerability_type: str):
         """Create and return appropriate attack object based on vulnerability type"""
 
-        # Normalize input to lowercase
+        # Normalize input to lowercase for comparisons
         normalized_type = vulnerability_type.lower().strip()
 
+        # Exact registry lookup first
         attack_class = cls._attack_registry.get(normalized_type)
         if attack_class:
             return attack_class()
 
-        # No match found - raise error
-        raise ValueError(f"Unsupported vulnerability type: {vulnerability_type}")
+        # Fuzzy / substring matching to handle descriptive LLM outputs
+        # Buffer overflow variants
+        if ("buffer overflow" in normalized_type or
+                "strcpy" in normalized_type or
+                "unsafe copy" in normalized_type or
+                "unsafe use of strcpy" in normalized_type):
+            return Buffer_Overflow_Attack()
+
+        # Format string variants
+        if ("format string" in normalized_type or
+                "printf" in normalized_type or
+                "format-string" in normalized_type):
+            return Format_String_Attack()
+
+        # Use-after-free variants
+        if ("use after free" in normalized_type or
+                "use-after-free" in normalized_type or
+                "uaf" in normalized_type):
+            return Use_After_Free_Attack()
+        # No match found - raise error with helpful message
+        msg = "Unsupported vulnerability type: {}".format(
+            vulnerability_type
+        )
+        raise ValueError(msg)
 
     @classmethod
     def register_attack(cls, vulnerability_type: str, attack_class: type):
