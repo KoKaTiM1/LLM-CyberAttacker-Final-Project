@@ -25,6 +25,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def sanitize_script_content(script_content: str) -> str:
+    """
+    Clean script content to remove problematic Unicode characters that can cause encoding errors.
+    Converts special Unicode characters (like U+202F narrow no-break space) to ASCII equivalents.
+    
+    Args:
+        script_content: The original script content
+        
+    Returns:
+        Clean ASCII-compatible script content
+    """
+    # Remove all non-ASCII characters by encoding to ASCII and ignoring errors
+    clean_content = script_content.encode('ascii', errors='ignore').decode('ascii')
+    return clean_content
+
+
 def analyze_exploitation_results(output: str, error: str = None, 
                                vulnerability_type: str = None) -> dict:
     """
@@ -272,9 +288,12 @@ class DockerContainerEnvironment(SandboxEnvironment):
             )
         
         try:
+            # Clean script content to remove problematic Unicode characters
+            clean_content = sanitize_script_content(script_content)
+            
             # Create a temporary file for the script
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-                f.write(script_content)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='ascii', errors='ignore') as f:
+                f.write(clean_content)
                 temp_script_path = f.name
             
             try:
@@ -400,8 +419,11 @@ class E2BAPIEnvironment(SandboxEnvironment):
             )
         
         try:
+            # Clean script content to remove problematic Unicode characters
+            clean_content = sanitize_script_content(script_content)
+            
             # Execute the script using E2B SDK
-            execution = self.sandbox.run_code(script_content, timeout=30)
+            execution = self.sandbox.run_code(clean_content, timeout=30)
             
             execution_time = time.time() - start_time
             
@@ -575,12 +597,15 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             )
         
         try:
+            # Clean script content to remove problematic Unicode characters
+            clean_content = sanitize_script_content(script_content)
+            
             # Create a temporary script file path in the VM
             script_file = "/tmp/sandbox_script.py"
             
             # Create a temporary file on the host system first
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-                temp_file.write(script_content)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='ascii', errors='ignore') as temp_file:
+                temp_file.write(clean_content)
                 temp_host_file = temp_file.name
             
             try:

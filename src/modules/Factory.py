@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from .sandbox import SandboxManager
 import json
 import logging
 
@@ -24,11 +25,13 @@ class Attack_Base(ABC):
 
 
 class Buffer_Overflow_Attack(Attack_Base):
-    """Concrete implementation for Buffer Overflow attacks"""
 
     def execute_attack(self, vulnerability_data: dict):
-        """Execute Buffer Overflow attack based on vulnerability data"""
-        return f"Executing buffer_overflow attack at {vulnerability_data.get('Location', 'unknown location')}"
+        sandbox_manager = SandboxManager()
+        if sandbox_manager.connect_all():
+            script="print('test')"
+            if sandbox_manager.run_test_on_all(script):
+                return True
 
     def get_attack_type(self) -> str:
         """Return attack type name"""
