@@ -206,6 +206,7 @@ class SandboxEnvironment(ABC):
 class DockerContainerEnvironment(SandboxEnvironment):
     """Docker Container environment implementation with C and Python support"""
     
+    # DockerContainerEnvironment.__init__
     def __init__(self, config: Dict[str, Any]):
         super().__init__("Docker_Container", config)
         # Use gcc image with both Python and gcc for multi-language support
@@ -213,6 +214,10 @@ class DockerContainerEnvironment(SandboxEnvironment):
         self.container_name = config.get("container_name", "sandbox-test")
         self.docker_command = config.get("docker_command", "docker")
         self.container_id = None
+        # Config-driven setup commands and Python packages
+        self.setup_commands: List[str] = config.get("setup_commands", []) or []
+        self.python_packages: List[str] = config.get("python_packages", []) or []
+
     
     def connect(self) -> bool:
         """Connect to Docker environment"""
@@ -274,25 +279,120 @@ class DockerContainerEnvironment(SandboxEnvironment):
             logger.error(f"Docker disconnection error: {e}")
             return False
     
+    # DockerContainerEnvironment.execute_script
     def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
-        """Execute script in Docker container with C and Python support"""
+        """Execute script in Docker container with C and Python support (+ setup_commands and python_packages)"""
         start_time = time.time()
-        
+
         if not self.is_connected:
             return TestResult(
                 environment=self.name,
                 success=False,
                 output="",
                 execution_time=0,
-                error="Not connected to Docker environment"
+                error="Not connected to Docker environment",
             )
-        
+
         try:
             if file_type.lower() == "c":
+                # For C, reuse existing implementation (no python packages needed)
                 return self._execute_c_script(script_content, start_time)
-            else:
-                return self._execute_python_script(script_content, start_time)
-                
+
+            # Python execution path with on-demand package install and setup_commands
+            # Determine packages to ensure inside the container
+            packages: List[str] = list(self.python_packages or [])
+
+            # Detect explicit pwntools usage in script
+            needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+            if needs_pwntools and "pwntools" not in packages:
+                packages.append("pwntools")
+
+            # Build installer prelude
+            packages_literal = json.dumps(packages)
+            install_prelude = f"""
+import subprocess
+import sys
+import importlib
+
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
+
+            # Write combined script (installer + user code) to a temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(install_prelude + script_content)
+                temp_script_path = f.name
+
+            try:
+                # Build shell pipeline inside container:
+                #   cd /tmp && <setup_commands> && python3 /script.py
+                shell_parts: List[str] = ["cd /tmp"]
+                if self.setup_commands:
+                    shell_parts.extend(self.setup_commands)
+                shell_parts.append("python3 /script.py")
+                shell_cmd = " && ".join(shell_parts)
+
+                docker_cmd = [
+                    self.docker_command, "run", "--rm",
+                    "-v", f"{temp_script_path}:/script.py",
+                    "-w", "/tmp",
+                    self.image,
+                    "bash", "-lc", shell_cmd,
+                ]
+
+                result = subprocess.run(
+                    docker_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                execution_time = time.time() - start_time
+
+                return TestResult(
+                    environment=self.name,
+                    success=result.returncode == 0,
+                    output=result.stdout,
+                    execution_time=execution_time,
+                    error=result.stderr if result.returncode != 0 else None,
+                )
+            finally:
+                try:
+                    os.unlink(temp_script_path)
+                except Exception:
+                    pass
+
         except Exception as e:
             execution_time = time.time() - start_time
             return TestResult(
@@ -300,7 +400,7 @@ class DockerContainerEnvironment(SandboxEnvironment):
                 success=False,
                 output="",
                 execution_time=execution_time,
-                error=f"Docker execution error: {e}"
+                error=f"Docker execution error: {e}",
             )
     
     def _execute_python_script(self, script_content: str, start_time: float) -> TestResult:
@@ -594,17 +694,22 @@ fi
                 execution_time=execution_time,
                 error=f"Docker attack execution error: {e}"
             )
+        
+        
 class E2BAPIEnvironment(SandboxEnvironment):
     """E2B API environment implementation using SDK"""
     
+    # E2BAPIEnvironment.__init__
     def __init__(self, config: Dict[str, Any]):
         super().__init__("E2B_API", config)
         self.api_key = config.get("api_key", "")
         self.sandbox = None
+        # Config-driven Python packages for the E2B sandbox
+        self.python_packages: List[str] = config.get("python_packages", []) or []
         
         # Set environment variable for E2B
         os.environ['E2B_API_KEY'] = self.api_key
-    
+
     def connect(self) -> bool:
         """Connect to E2B API environment"""
         try:
@@ -643,8 +748,9 @@ class E2BAPIEnvironment(SandboxEnvironment):
             logger.error(f"E2B API disconnection error: {e}")
             return False
     
+    # E2BAPIEnvironment.execute_script
     def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
-        """Execute script in E2B API with Python wrapper for C code"""
+        """Execute script in E2B API with Python wrapper for C code and on-demand package install"""
         start_time = time.time()
         
         if not self.is_connected or not self.sandbox:
@@ -659,43 +765,59 @@ class E2BAPIEnvironment(SandboxEnvironment):
         try:
             if file_type.lower() == "c":
                 # Create Python wrapper for C code
-                python_wrapper = self._create_c_wrapper(script_content)
-                final_script = python_wrapper
+                final_script = self._create_c_wrapper(script_content)
             else:
-                # For Python scripts, check if they need pwntools
-                needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+                # Python execution with config-driven package installation
+                packages: List[str] = list(self.python_packages or [])
                 
-                if needs_pwntools:
-                    # Add pwntools installation before the actual script
-                    install_script = """
+                # Detect explicit pwntools usage in script
+                needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+                if needs_pwntools and "pwntools" not in packages:
+                    packages.append("pwntools")
+                
+                packages_literal = json.dumps(packages)
+                install_script = f"""
 import subprocess
 import sys
+import importlib
 
-# Install pwntools if needed
-try:
-    import pwn
-    print("✅ pwntools already available")
-except ImportError:
-    print("📦 Installing pwntools...")
-    try:
-        result = subprocess.run([
-            sys.executable, "-m", "pip", "install", "pwntools"
-        ], capture_output=True, text=True, timeout=120)
-        
-        if result.returncode == 0:
-            print("✅ pwntools installation successful")
-        else:
-            print("❌ pwntools installation failed:", result.stderr)
-    except Exception as e:
-        print(f"❌ Installation error: {e}")
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
 
-# Original script follows:
-"""
-                    final_script = install_script + script_content
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
                 else:
-                    final_script = script_content
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
+                final_script = install_script + script_content
                 
-                execution = self.sandbox.run_code(final_script, timeout=60)
+            execution = self.sandbox.run_code(final_script, timeout=60)
             
             execution_time = time.time() - start_time
             
@@ -734,7 +856,7 @@ except ImportError:
                 execution_time=execution_time,
                 error=f"E2B API execution error: {e}"
             )
-    
+
     def _create_c_wrapper(self, c_code: str) -> str:
         """Create Python wrapper to compile and execute C code in E2B"""
         python_wrapper = f'''
@@ -978,6 +1100,7 @@ if result.stderr:
 class VirtualBoxEnvironment(SandboxEnvironment):
     """VirtualBox environment implementation"""
     
+    # VirtualBoxEnvironment.__init__
     def __init__(self, config: Dict[str, Any]):
         super().__init__("VirtualBox", config)
         self.vm_name = config.get("vm_name", "")
@@ -985,7 +1108,12 @@ class VirtualBoxEnvironment(SandboxEnvironment):
         self.password = config.get("password", "")
         self.vboxmanage_path = config.get("vboxmanage_path", "VBoxManage")
         self.python_path = config.get("python_path", "/usr/bin/python3")
-    
+        # Config-driven setup commands and Python packages
+        self.setup_commands: List[str] = config.get("setup_commands", []) or []
+        self.python_packages: List[str] = config.get("python_packages", []) or []
+        # Internal flag to ensure setup_commands run only once per VM session
+        self._vm_setup_executed: bool = False
+
     def connect(self) -> bool:
         """Connect to VirtualBox VM"""
         try:
@@ -1107,8 +1235,9 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             self.is_connected = False
             return False
     
+    # VirtualBoxEnvironment.execute_script
     def execute_script(self, script_content: str, file_type: str = "python") -> TestResult:
-        """Execute script in VirtualBox VM with C and Python support"""
+        """Execute script in VirtualBox VM with C and Python support, including setup_commands and python_packages"""
         start_time = time.time()
         
         if not self.is_connected:
@@ -1121,10 +1250,80 @@ class VirtualBoxEnvironment(SandboxEnvironment):
             )
         
         try:
+            # Run one-time VM setup commands if configured
+            if self.setup_commands and not getattr(self, "_vm_setup_executed", False):
+                for cmd in self.setup_commands:
+                    try:
+                        setup_cmd = [
+                            self.vboxmanage_path, "guestcontrol", self.vm_name,
+                            "run", "--username", self.username, "--password", self.password,
+                            "--exe", "/bin/bash", "--", "/bin/bash", "-lc", cmd,
+                        ]
+                        subprocess.run(
+                            setup_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout=300,
+                        )
+                    except Exception as setup_err:
+                        logger.warning(f"VirtualBox setup command failed (ignored): {setup_err}")
+                self._vm_setup_executed = True
+            
             if file_type.lower() == "c":
                 return self._execute_c_script_vm(script_content, start_time)
-            else:
-                return self._execute_python_script_vm(script_content, start_time)
+            
+            # Python execution with config-driven package installation
+            packages: List[str] = list(self.python_packages or [])
+            
+            # Detect explicit pwntools usage in script
+            needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+            if needs_pwntools and "pwntools" not in packages:
+                packages.append("pwntools")
+            
+            packages_literal = json.dumps(packages)
+            install_script = f"""
+import subprocess
+import sys
+import importlib
+
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
+            combined_script = install_script + script_content
+            
+            # Reuse existing VM Python execution helper with the combined script
+            return self._execute_python_script_vm(combined_script, start_time)
                 
         except Exception as e:
             execution_time = time.time() - start_time
@@ -1135,7 +1334,7 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 execution_time=execution_time,
                 error=f"VirtualBox execution error: {e}"
             )
-    
+
     def _execute_python_script_vm(self, script_content: str, start_time: float) -> TestResult:
         """Execute Python script in VirtualBox VM"""
         # Check if script needs pwntools
