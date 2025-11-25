@@ -305,9 +305,43 @@ class DockerContainerEnvironment(SandboxEnvironment):
     
     def _execute_python_script(self, script_content: str, start_time: float) -> TestResult:
         """Execute Python script in Docker container"""
+        # Check if script needs pwntools
+        needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+        
         # Create a temporary file for the Python script
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(script_content)
+            if needs_pwntools:
+                # Add pwntools installation at the beginning
+                install_script = """
+import subprocess
+import sys
+import os
+
+# Install pwntools if not already installed
+try:
+    import pwn
+    print("✅ pwntools already available")
+except ImportError:
+    print("📦 Installing pwntools...")
+    try:
+        # Install with break-system-packages flag for newer Python versions
+        result = subprocess.run([
+            sys.executable, "-m", "pip", "install", "pwntools", 
+            "--break-system-packages"
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            print("✅ pwntools installation successful")
+        else:
+            print("❌ pwntools installation failed:", result.stderr)
+    except Exception as e:
+        print(f"❌ Installation error: {e}")
+
+# Original script follows:
+"""
+                f.write(install_script + script_content)
+            else:
+                f.write(script_content)
             temp_script_path = f.name
         
         try:
@@ -626,10 +660,42 @@ class E2BAPIEnvironment(SandboxEnvironment):
             if file_type.lower() == "c":
                 # Create Python wrapper for C code
                 python_wrapper = self._create_c_wrapper(script_content)
-                execution = self.sandbox.run_code(python_wrapper, timeout=30)
+                final_script = python_wrapper
             else:
-                # Execute Python code directly
-                execution = self.sandbox.run_code(script_content, timeout=30)
+                # For Python scripts, check if they need pwntools
+                needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+                
+                if needs_pwntools:
+                    # Add pwntools installation before the actual script
+                    install_script = """
+import subprocess
+import sys
+
+# Install pwntools if needed
+try:
+    import pwn
+    print("✅ pwntools already available")
+except ImportError:
+    print("📦 Installing pwntools...")
+    try:
+        result = subprocess.run([
+            sys.executable, "-m", "pip", "install", "pwntools"
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            print("✅ pwntools installation successful")
+        else:
+            print("❌ pwntools installation failed:", result.stderr)
+    except Exception as e:
+        print(f"❌ Installation error: {e}")
+
+# Original script follows:
+"""
+                    final_script = install_script + script_content
+                else:
+                    final_script = script_content
+                
+                execution = self.sandbox.run_code(final_script, timeout=60)
             
             execution_time = time.time() - start_time
             
@@ -1072,12 +1138,45 @@ class VirtualBoxEnvironment(SandboxEnvironment):
     
     def _execute_python_script_vm(self, script_content: str, start_time: float) -> TestResult:
         """Execute Python script in VirtualBox VM"""
+        # Check if script needs pwntools
+        needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+        
         # Create a temporary script file path in the VM
         script_file = "/tmp/sandbox_script.py"
         
         # Create a temporary file on the host system first
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-            temp_file.write(script_content)
+            if needs_pwntools:
+                # Add pwntools installation at the beginning
+                install_script = """
+import subprocess
+import sys
+import os
+
+# Install pwntools if not already installed
+try:
+    import pwn
+    print("✅ pwntools already available")
+except ImportError:
+    print("📦 Installing pwntools...")
+    try:
+        # Install with user flag to avoid permission issues
+        result = subprocess.run([
+            sys.executable, "-m", "pip", "install", "pwntools", "--user"
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            print("✅ pwntools installation successful")
+        else:
+            print("❌ pwntools installation failed:", result.stderr)
+    except Exception as e:
+        print(f"❌ Installation error: {e}")
+
+# Original script follows:
+"""
+                temp_file.write(install_script + script_content)
+            else:
+                temp_file.write(script_content)
             temp_host_file = temp_file.name
         
         try:
