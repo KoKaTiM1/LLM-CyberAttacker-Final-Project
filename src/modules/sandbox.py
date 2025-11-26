@@ -2008,21 +2008,9 @@ class SandboxManager:
             log_filename = None
         
         # Return structured data for LangGraph
-        return {
-            'status': 'success',
-            'exploitation_successful': exploitation_successful,
-            'environments_tested': len(results),
-            'results': detailed_results,
-            'logs_saved_to': log_filename,
-            'timestamp': timestamp,
-            'summary': {
-                'total_environments': len(results),
-                'successful_executions': sum(1 for r in results.values() if r.success),
-                'successful_exploitations': sum(1 for env_name in detailed_results 
-                                               if detailed_results[env_name]['exploitation_analysis']['exploitation_successful']),
-                'learning_suggestions': self._extract_key_suggestions(detailed_results)
-            }
-        }
+                # Return per-environment results as expected by callers
+        return detailed_results
+
     
     def _extract_key_suggestions(self, detailed_results: dict) -> list:
         """Extract key learning suggestions from all environment results"""
