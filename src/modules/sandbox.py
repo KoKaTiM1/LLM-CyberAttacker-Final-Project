@@ -240,7 +240,7 @@ class DockerContainerEnvironment(SandboxEnvironment):
                 [self.docker_command, "pull", self.image],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120
             )
             
             if pull_result.returncode != 0:
@@ -375,7 +375,7 @@ _ensure_sandbox_packages()
                     docker_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=60,
+                    timeout=120
                 )
 
                 execution_time = time.time() - start_time
@@ -717,7 +717,7 @@ class E2BAPIEnvironment(SandboxEnvironment):
             from e2b_code_interpreter import Sandbox
             
             # Create a new sandbox
-            self.sandbox = Sandbox.create(timeout=60)
+            self.sandbox = Sandbox.create(timeout=120)
             self.is_connected = True
             logger.info(f"Connected to E2B API with sandbox ID: {self.sandbox.sandbox_id}")
             return True
@@ -817,7 +817,7 @@ _ensure_sandbox_packages()
 """
                 final_script = install_script + script_content
                 
-            execution = self.sandbox.run_code(final_script, timeout=60)
+            execution = self.sandbox.run_code(final_script, timeout=120)
             
             execution_time = time.time() - start_time
             
@@ -1069,7 +1069,7 @@ os.chmod('/tmp/attack_script', 0o755)
 
 # Execute against target
 result = subprocess.run(['/tmp/attack_script', '{target_file}'], 
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=120)
 print(result.stdout)
 if result.stderr:
     print(f"Error: {{result.stderr}}", file=sys.stderr)
@@ -1148,7 +1148,7 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                     [self.vboxmanage_path, "startvm", self.vm_name, "--type", "headless"],
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=120
                 )
                 
                 if start_result.returncode != 0:
@@ -1420,7 +1420,7 @@ except ImportError:
             exec_cmd,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=120
         )
         
         execution_time = time.time() - start_time
@@ -1510,7 +1510,7 @@ except ImportError:
             exec_cmd,
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=120
         )
         
         execution_time = time.time() - start_time
@@ -1587,7 +1587,7 @@ except ImportError:
                 copy_cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120
             )
             
             if result.returncode == 0:
@@ -1707,7 +1707,7 @@ except ImportError:
                     compile_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=120
                 )
                 
                 if compile_result.returncode != 0:
