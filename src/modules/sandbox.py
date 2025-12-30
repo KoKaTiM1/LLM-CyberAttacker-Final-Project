@@ -37,7 +37,8 @@ def analyze_exploitation_results(output: str, error: str = None,
         "buffer overflow": [
             "shell spawned", "code execution", "overflow confirmed", 
             "eip control", "return address", "shellcode executed",
-            "segmentation fault with control"
+            "segmentation fault with control", "generated payload",
+            "payload components"
         ],
         "format string": [
             "memory leaked", "stack dumped", "format string exploited",
@@ -50,7 +51,8 @@ def analyze_exploitation_results(output: str, error: str = None,
         ],
         "general": [
             "exploit successful", "vulnerability confirmed", "attack succeeded",
-            "system compromised", "access gained", "privilege escalation"
+            "system compromised", "access gained", "privilege escalation",
+            "generated payload", "payload components"
         ]
     }
     
@@ -227,6 +229,8 @@ class DockerContainerEnvironment(SandboxEnvironment):
                 [self.docker_command, "--version"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=5
             )
             
@@ -240,6 +244,8 @@ class DockerContainerEnvironment(SandboxEnvironment):
                 [self.docker_command, "pull", self.image],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=120
             )
             
@@ -335,7 +341,9 @@ def _ensure_sandbox_packages():
                         cmd,
                         capture_output=True,
                         text=True,
-                        timeout=300,
+                        encoding='utf-8',
+                errors='replace',
+                timeout=300,
                     )
                     if result.returncode == 0:
                         break
@@ -350,7 +358,7 @@ _ensure_sandbox_packages()
 """
 
             # Write combined script (installer + user code) to a temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
                 f.write(install_prelude + script_content)
                 temp_script_path = f.name
 
@@ -375,7 +383,9 @@ _ensure_sandbox_packages()
                     docker_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    encoding='utf-8',
+                errors='replace',
+                timeout=300
                 )
 
                 execution_time = time.time() - start_time
@@ -409,7 +419,7 @@ _ensure_sandbox_packages()
         needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
         
         # Create a temporary file for the Python script
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
             if needs_pwntools:
                 # Add pwntools installation at the beginning
                 install_script = """
@@ -428,14 +438,16 @@ except ImportError:
         result = subprocess.run([
             sys.executable, "-m", "pip", "install", "pwntools", 
             "--break-system-packages"
-        ], capture_output=True, text=True, timeout=120)
+        ], capture_output=True, text=True, encoding='utf-8',
+                errors='replace',
+                timeout=120)
         
         if result.returncode == 0:
-            print("✅ pwntools installation successful")
+            print(" pwntools installation successful")
         else:
-            print("❌ pwntools installation failed:", result.stderr)
+            print(" pwntools installation failed:", result.stderr)
     except Exception as e:
-        print(f"❌ Installation error: {e}")
+        print(f" Installation error: {e}")
 
 # Original script follows:
 """
@@ -459,6 +471,8 @@ except ImportError:
                 docker_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=30
             )
             
@@ -479,7 +493,7 @@ except ImportError:
     def _execute_c_script(self, script_content: str, start_time: float) -> TestResult:
         """Execute C script in Docker container with compilation"""
         # Create a temporary file for the C source code
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False, encoding='utf-8') as f:
             f.write(script_content)
             temp_c_path = f.name
         
@@ -496,6 +510,8 @@ except ImportError:
                 docker_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=30
             )
             
@@ -576,7 +592,9 @@ except ImportError:
             result = subprocess.run(
                 [self.docker_command, "run", "--rm", "-v", f"{file_path}:{file_path}",
                  self.image, "chmod", "+x", file_path],
-                capture_output=True, text=True, timeout=30
+                capture_output=True, text=True, encoding='utf-8',
+                errors='replace',
+                timeout=30
             )
             
             if result.returncode == 0:
@@ -607,7 +625,7 @@ except ImportError:
         try:
             # Create temp file for attack script
             with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}',
-                                           delete=False) as f:
+                                           delete=False, encoding='utf-8') as f:
                 f.write(attack_script)
                 temp_script_path = f.name
             
@@ -658,6 +676,8 @@ fi
                 docker_cmd,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=120  # Longer timeout for complex attacks
             )
             
@@ -716,8 +736,8 @@ class E2BAPIEnvironment(SandboxEnvironment):
             # Import E2B SDK
             from e2b_code_interpreter import Sandbox
             
-            # Create a new sandbox
-            self.sandbox = Sandbox.create(timeout=120)
+            # Create a new sandbox with longer timeout
+            self.sandbox = Sandbox.create(timeout=300)
             self.is_connected = True
             logger.info(f"Connected to E2B API with sandbox ID: {self.sandbox.sandbox_id}")
             return True
@@ -802,7 +822,9 @@ def _ensure_sandbox_packages():
                         cmd,
                         capture_output=True,
                         text=True,
-                        timeout=300,
+                        encoding='utf-8',
+                errors='replace',
+                timeout=300,
                     )
                     if result.returncode == 0:
                         break
@@ -817,7 +839,7 @@ _ensure_sandbox_packages()
 """
                 final_script = install_script + script_content
                 
-            execution = self.sandbox.run_code(final_script, timeout=120)
+            execution = self.sandbox.run_code(final_script, timeout=300)
             
             execution_time = time.time() - start_time
             
@@ -869,7 +891,7 @@ c_source = """{c_code}"""
 
 try:
     # Create temporary C file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False, encoding='utf-8') as f:
         f.write(c_source)
         c_file_path = f.name
     
@@ -878,7 +900,9 @@ try:
     compile_result = subprocess.run(
         ['gcc', '-o', binary_path, c_file_path, '-w'],
         capture_output=True,
-        text=True
+        text=True,
+                encoding='utf-8',
+                errors='replace'
     )
     
     if compile_result.returncode != 0:
@@ -891,7 +915,9 @@ try:
             [binary_path],
             capture_output=True,
             text=True,
-            timeout=10
+            encoding='utf-8',
+                errors='replace',
+                timeout=10
         )
         
         if exec_result.stdout:
@@ -1069,7 +1095,9 @@ os.chmod('/tmp/attack_script', 0o755)
 
 # Execute against target
 result = subprocess.run(['/tmp/attack_script', '{target_file}'], 
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, encoding='utf-8',
+                errors='replace',
+                timeout=120)
 print(result.stdout)
 if result.stderr:
     print(f"Error: {{result.stderr}}", file=sys.stderr)
@@ -1122,6 +1150,8 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 [self.vboxmanage_path, "--version"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=10
             )
             
@@ -1134,6 +1164,8 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 [self.vboxmanage_path, "showvminfo", self.vm_name, "--machinereadable"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=10
             )
             
@@ -1148,7 +1180,9 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                     [self.vboxmanage_path, "startvm", self.vm_name, "--type", "headless"],
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    encoding='utf-8',
+                errors='replace',
+                timeout=120
                 )
                 
                 if start_result.returncode != 0:
@@ -1180,6 +1214,8 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 [self.vboxmanage_path, "controlvm", self.vm_name, "acpipowerbutton"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=30
             )
             
@@ -1197,7 +1233,9 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                     [self.vboxmanage_path, "showvminfo", self.vm_name, "--machinereadable"],
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    encoding='utf-8',
+                errors='replace',
+                timeout=10
                 )
                 
                 if check_result.returncode == 0:
@@ -1217,6 +1255,8 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 [self.vboxmanage_path, "controlvm", self.vm_name, "poweroff"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=15
             )
             
@@ -1263,7 +1303,9 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                             setup_cmd,
                             capture_output=True,
                             text=True,
-                            timeout=300,
+                            encoding='utf-8',
+                errors='replace',
+                timeout=300,
                         )
                     except Exception as setup_err:
                         logger.warning(f"VirtualBox setup command failed (ignored): {setup_err}")
@@ -1285,35 +1327,49 @@ class VirtualBoxEnvironment(SandboxEnvironment):
 import subprocess
 import sys
 import importlib
+import os
 
 _SANDBOX_PACKAGES = {packages_literal}
 _SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+_VENV_PATH = '/home/sandbox/env_sandbox'
 
 def _ensure_sandbox_packages():
+    # Use venv python if available
+    venv_python = os.path.join(_VENV_PATH, 'bin', 'python')
+    venv_pip = os.path.join(_VENV_PATH, 'bin', 'pip')
+    
+    # Check if venv exists and use it
+    if os.path.exists(venv_python):
+        print(f"[sandbox] Using virtual environment: {{_VENV_PATH}}")
+        sys.executable = venv_python
+    else:
+        print(f"[sandbox] Warning: venv not found at {{_VENV_PATH}}, using system Python")
+    
     for pkg in _SANDBOX_PACKAGES:
         import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
         try:
             importlib.import_module(import_name)
+            print(f"[sandbox] Package {{pkg}} already installed")
         except ImportError:
+            print(f"[sandbox] Installing {{pkg}}...")
             try:
-                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
-                candidate_cmds = [
-                    base_cmd + ['--break-system-packages'],
-                    base_cmd,
-                ]
-                last_error = ''
-                for cmd in candidate_cmds:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                    )
-                    if result.returncode == 0:
-                        break
-                    last_error = result.stderr
+                # Install using venv pip if available
+                if os.path.exists(venv_pip):
+                    install_cmd = [venv_pip, 'install', pkg]
                 else:
-                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+                    install_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                
+                print(f"[sandbox] Running: {{' '.join(install_cmd)}}")
+                result = subprocess.run(
+                    install_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if result.returncode == 0:
+                    print(f"[sandbox] Successfully installed {{pkg}}")
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{result.stderr}}")
             except Exception as e:
                 print(f"[sandbox] Error installing {{pkg}}: {{e}}")
 
@@ -1337,45 +1393,15 @@ _ensure_sandbox_packages()
 
     def _execute_python_script_vm(self, script_content: str, start_time: float) -> TestResult:
         """Execute Python script in VirtualBox VM"""
-        # Check if script needs pwntools
-        needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+        # Note: script_content already includes installer prelude from execute_script()
+        # which properly handles --break-system-packages flag
         
         # Create a temporary script file path in the VM
         script_file = "/tmp/sandbox_script.py"
         
         # Create a temporary file on the host system first
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-            if needs_pwntools:
-                # Add pwntools installation at the beginning
-                install_script = """
-import subprocess
-import sys
-import os
-
-# Install pwntools if not already installed
-try:
-    import pwn
-    print("✅ pwntools already available")
-except ImportError:
-    print("📦 Installing pwntools...")
-    try:
-        # Install with user flag to avoid permission issues
-        result = subprocess.run([
-            sys.executable, "-m", "pip", "install", "pwntools", "--user"
-        ], capture_output=True, text=True, timeout=120)
-        
-        if result.returncode == 0:
-            print("✅ pwntools installation successful")
-        else:
-            print("❌ pwntools installation failed:", result.stderr)
-    except Exception as e:
-        print(f"❌ Installation error: {e}")
-
-# Original script follows:
-"""
-                temp_file.write(install_script + script_content)
-            else:
-                temp_file.write(script_content)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(script_content)
             temp_host_file = temp_file.name
         
         try:
@@ -1390,7 +1416,9 @@ except ImportError:
                 copy_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                encoding='utf-8',
+                errors='replace',
+                timeout=500
             )
         finally:
             # Clean up temporary host file
@@ -1409,18 +1437,21 @@ except ImportError:
                 error=f"Failed to copy script to VM: {copy_result.stderr}"
             )
         
-        # Execute script in VM
+        # Execute script in VM using venv Python
+        venv_python = "/home/sandbox/env_sandbox/bin/python"
         exec_cmd = [
             self.vboxmanage_path, "guestcontrol", self.vm_name,
             "run", "--username", self.username, "--password", self.password,
-            "--exe", self.python_path, "--", script_file
+            "--exe", venv_python, "--", script_file
         ]
         
         exec_result = subprocess.run(
             exec_cmd,
             capture_output=True,
             text=True,
-            timeout=120
+            encoding='utf-8',
+                errors='replace',
+                timeout=500
         )
         
         execution_time = time.time() - start_time
@@ -1440,7 +1471,7 @@ except ImportError:
         binary_file = "/tmp/sandbox_program"
         
         # Create a temporary file on the host system first
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as temp_file:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False, encoding='utf-8') as temp_file:
             temp_file.write(script_content)
             temp_host_file = temp_file.name
         
@@ -1456,7 +1487,9 @@ except ImportError:
                 copy_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                encoding='utf-8',
+                errors='replace',
+                timeout=500
             )
         finally:
             # Clean up temporary host file
@@ -1486,7 +1519,9 @@ except ImportError:
             compile_cmd,
             capture_output=True,
             text=True,
-            timeout=30
+            encoding='utf-8',
+                errors='replace',
+                timeout=500
         )
         
         if compile_result.returncode != 0:
@@ -1510,7 +1545,9 @@ except ImportError:
             exec_cmd,
             capture_output=True,
             text=True,
-            timeout=120
+            encoding='utf-8',
+                errors='replace',
+                timeout=500
         )
         
         execution_time = time.time() - start_time
@@ -1534,6 +1571,8 @@ except ImportError:
                 [self.vboxmanage_path, "showvminfo", self.vm_name, "--machinereadable"],
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=10
             )
             
@@ -1549,7 +1588,9 @@ except ImportError:
                     test_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    encoding='utf-8',
+                errors='replace',
+                timeout=500
                 )
                 
                 return test_result.returncode == 0
@@ -1587,7 +1628,9 @@ except ImportError:
                 copy_cmd,
                 capture_output=True,
                 text=True,
-                timeout=120
+                encoding='utf-8',
+                errors='replace',
+                timeout=500
             )
             
             if result.returncode == 0:
@@ -1618,7 +1661,9 @@ except ImportError:
                 chmod_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                encoding='utf-8',
+                errors='replace',
+                timeout=500
             )
             
             if result.returncode == 0:
@@ -1649,7 +1694,7 @@ except ImportError:
         try:
             # Create temporary script file on host
             with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}', 
-                                           delete=False) as f:
+                                           delete=False, encoding='utf-8') as f:
                 f.write(attack_script)
                 temp_script_path = f.name
             
@@ -1666,7 +1711,9 @@ except ImportError:
                 copy_cmd,
                 capture_output=True,
                 text=True,
-                timeout=30
+                encoding='utf-8',
+                errors='replace',
+                timeout=500
             )
             
             # Clean up temp file
@@ -1707,7 +1754,9 @@ except ImportError:
                     compile_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    encoding='utf-8',
+                errors='replace',
+                timeout=500
                 )
                 
                 if compile_result.returncode != 0:
@@ -1739,7 +1788,9 @@ except ImportError:
                 exec_cmd,
                 capture_output=True,
                 text=True,
-                timeout=120  # Longer timeout for complex attacks
+                encoding='utf-8',
+                errors='replace',
+                timeout=500  # Longer timeout for complex attacks
             )
             
             execution_time = time.time() - start_time
