@@ -116,8 +116,7 @@ dmypy.json
 *~
 
 # API Keys and sensitive data
-#*.key
-config.py
+*.key
 secrets.json
 sandbox_config.json
 
