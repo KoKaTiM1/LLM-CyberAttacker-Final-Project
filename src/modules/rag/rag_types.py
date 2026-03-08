@@ -1,5 +1,5 @@
 """
-types.py
+rag_types.py
 
 Purpose:
 - Shared datatypes for the local CVE RAG pipeline.
