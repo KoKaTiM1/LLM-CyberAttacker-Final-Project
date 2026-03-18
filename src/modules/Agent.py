@@ -1,6 +1,9 @@
 import json
 import requests
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def extract_code_from_markdown(text: str) -> str:
@@ -32,6 +35,70 @@ def extract_code_from_markdown(text: str) -> str:
     
     # If no code block found, return original text
     return text
+
+
+def generateExploitWithDynamicPrompt(vulnerability_data: dict, system_prompt: str, user_prompt: str):
+    """
+    Generate exploit script using dynamic prompts from Orchestrator.
+    This is the new approach that uses context-aware, expert-specific prompts.
+    
+    Args:
+        vulnerability_data: Dictionary with vulnerability details
+        system_prompt: Expert profile prompt from Orchestrator
+        user_prompt: Task-specific prompt from Orchestrator
+        
+    Returns:
+        Generated exploit code or None if generation fails
+    """
+    url = "http://localhost:11434/api/generate"
+    
+    # Combine prompts with vulnerability data
+    combined_prompt = f"{system_prompt}\n\n{user_prompt}\n\n"
+    combined_prompt += "## Vulnerability Details\n"
+    combined_prompt += f"Type: {vulnerability_data.get('Type', 'Unknown')}\n"
+    combined_prompt += f"Location: {vulnerability_data.get('Location', 'Unknown')}\n"
+    combined_prompt += f"Explanation: {vulnerability_data.get('Explanation', 'Unknown')}\n"
+    combined_prompt += "\nGenerate the exploit code now:"
+    
+    payload = {
+        "model": "gpt-oss:20b",
+        "prompt": combined_prompt,
+        "stream": False
+    }
+    
+    logger.info("="*60)
+    logger.info("[generateExploitWithDynamicPrompt] SENDING REQUEST TO LLM")
+    logger.info("="*60)
+    logger.info(f"URL: {url}")
+    logger.info(f"Model: gpt-oss:20b")
+    logger.info(f"Prompt length: {len(combined_prompt)} chars")
+    logger.info(f"--- PROMPT START ---")
+    logger.info(combined_prompt)
+    logger.info(f"--- PROMPT END ---")
+    
+    try:
+        response = requests.post(url, json=payload, timeout=60000)
+        logger.info(f"Response Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            if isinstance(response_data, dict) and 'response' in response_data:
+                llm_response = response_data['response']
+                logger.info(f"--- LLM RAW RESPONSE START ---")
+                logger.info(llm_response)
+                logger.info(f"--- LLM RAW RESPONSE END ---")
+                extracted = extract_code_from_markdown(llm_response)
+                logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
+                logger.info(extracted)
+                logger.info(f"--- EXTRACTED CODE END ---")
+                return extracted
+            return response_data
+        else:
+            logger.error(f"Error: {response.status_code}, {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Request failed: {e}")
+        return None
 
 
 def resultsFromLLM(LLMresult):
@@ -81,60 +148,33 @@ def resultsFromLLM(LLMresult):
             "prompt": prompt,
             "stream": False
         }
+        
+        logger.info("="*60)
+        logger.info("[resultsFromLLM] SENDING REQUEST TO LLM")
+        logger.info("="*60)
+        logger.info(f"Prompt length: {len(prompt)} chars")
+        logger.info(f"--- PROMPT START ---")
+        logger.info(prompt)
+        logger.info(f"--- PROMPT END ---")
+        
         response = requests.post(url, json=payload, timeout=60000)
-        print(f"Exploit Generation Response Status: {response.status_code}")
+        logger.info(f"Response Status: {response.status_code}")
         if response.status_code == 200:
             response_data = response.json()
-            print(f"Exploit Generation Response: {response_data}")
-            # Extract just the code/response text from the LLM response
             if isinstance(response_data, dict) and 'response' in response_data:
                 llm_response = response_data['response']
-                # Extract Python code from markdown if present
-                return extract_code_from_markdown(llm_response)
+                logger.info(f"--- LLM RAW RESPONSE START ---")
+                logger.info(llm_response)
+                logger.info(f"--- LLM RAW RESPONSE END ---")
+                extracted = extract_code_from_markdown(llm_response)
+                logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
+                logger.info(extracted)
+                logger.info(f"--- EXTRACTED CODE END ---")
+                return extracted
             return response_data
         else:
-            print(f"Error: {response.status_code}, {response.text}")
+            logger.error(f"Error: {response.status_code}, {response.text}")
             return None
     except Exception as e:
         print(f"Request failed: {e}")
         return None
-'''
-def resultsFromLLM(LLMresult):
-    API_KEY = ""
-    url = ""
-    data = json.loads(LLMresult)
-    if not data["Type"] or not data["Location"] or not data["Explanation"]:
-        print("Json file from LLM is missing details")
-        return
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
-    }
-
-    payload = {
-        "model": "oss-20b",
-        "messages": [
-            {"role": "system", "content": "You are an expert exploit developer."},
-            {"role": "user", "content": f"""Here is a vulnerability that was found in a C file:
-
-    Type: {data["Type"]}
-    Location: {data["Location"]}
-    Explanation: {data["Explanation"]}
-
-    Please generate a Python proof-of-concept exploit script that demonstrates how this vulnerability can be exploited.
-    The script should be runnable and include necessary comments."""}
-        ]
-    }
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        if response.status_code == 200:
-            process_vulnerability_and_attack(LLMresult)
-
-        else:
-            print(f"Error: {response.status_code}, {response.text}")
-            return None
-    except Exception as e:
-        print(f"Request failed: {e}")
-        return None
-        return response.json()
-'''

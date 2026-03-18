@@ -1,7 +1,9 @@
 from pathlib import Path
-from urllib import response
 import requests
+import logging
 from .Agent import resultsFromLLM
+
+logger = logging.getLogger(__name__)
 
 
 def getFile(path: Path) -> bool:
@@ -46,6 +48,71 @@ def checkConnectionWithOllama() -> bool:
 def checkAPIconnectionWithAgent() -> bool:
     # For Ollama, we can use the same connection check as checkConnectionWithOllama
     return checkConnectionWithOllama()
+
+def sendToLLMWithDynamicPrompt(system_prompt: str, user_prompt: str, model: str = "gpt-oss:20b"):
+    """
+    Send request to LLM with separate system and user prompts (dynamic prompts).
+    This function is used by the Orchestrator to send customized prompts.
+    
+    Args:
+        system_prompt: The system/role prompt (e.g., expert profile)
+        user_prompt: The user's task/question prompt (e.g., CVE analysis task)
+        model: The model to use (default: gpt-oss:20b)
+    
+    Returns:
+        LLM response dictionary or None if request fails
+    """
+    url = "http://localhost:11434/api/generate"
+    
+    # Combine system and user prompts for Ollama
+    combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+    
+    data = {
+        "model": model,
+        "prompt": combined_prompt,
+        "stream": False
+    }
+    
+    logger.info("="*60)
+    logger.info("[sendToLLMWithDynamicPrompt] SENDING REQUEST TO LLM")
+    logger.info("="*60)
+    logger.info(f"URL: {url}")
+    logger.info(f"Model: {model}")
+    logger.info(f"Prompt length: {len(combined_prompt)} chars")
+    logger.info(f"--- PROMPT START ---")
+    logger.info(combined_prompt)
+    logger.info(f"--- PROMPT END ---")
+    
+    try:
+        response = requests.post(url, json=data, timeout=60000)
+        logger.info(f"Response Status: {response.status_code}")
+        if response.status_code == 200:
+            ollama_response = response.json()
+            if 'response' in ollama_response:
+                # Clean the response text from markdown code blocks
+                response_text = ollama_response['response'].strip()
+                if response_text.startswith('```json'):
+                    response_text = response_text[7:]
+                    if response_text.endswith('```'):
+                        response_text = response_text[:-3]
+                elif response_text.startswith('```'):
+                    response_text = response_text[3:]
+                    if response_text.endswith('```'):
+                        response_text = response_text[:-3]
+                
+                ollama_response['response'] = response_text.strip()
+                logger.info(f"--- LLM RESPONSE START ---")
+                logger.info(ollama_response['response'])
+                logger.info(f"--- LLM RESPONSE END ---")
+                return ollama_response
+            return ollama_response
+        else:
+            logger.error(f"Error: {response.status_code}, {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Request failed: {e}")
+        return None
+
 def sendToLLM(content):
     url = "http://localhost:11434/api/generate"
     data = {
@@ -72,7 +139,16 @@ def sendToLLM(content):
         "stream": False
     }
 
+    logger.info("="*60)
+    logger.info("[sendToLLM] SENDING REQUEST TO LLM")
+    logger.info("="*60)
+    logger.info(f"Prompt length: {len(data['prompt'])} chars")
+    logger.info(f"--- PROMPT START ---")
+    logger.info(data['prompt'])
+    logger.info(f"--- PROMPT END ---")
+    
     response = requests.post(url, json=data, timeout=60000)
+    logger.info(f"Response Status: {response.status_code}")
     if response.status_code == 200:
         ollama_response = response.json()
         if 'response' in ollama_response:
@@ -89,42 +165,11 @@ def sendToLLM(content):
             
             # Return cleaned response in Ollama format
             ollama_response['response'] = response_text.strip()
+            logger.info(f"--- LLM RESPONSE START ---")
+            logger.info(ollama_response['response'])
+            logger.info(f"--- LLM RESPONSE END ---")
             return ollama_response
         return ollama_response
     else:
-        print(f"Error: {response.status_code}, {response.text}")
+        logger.error(f"Error: {response.status_code}, {response.text}")
         return None
-
-"""
-def sendToLLM(content):
-    API_KEY = ""
-    url = ""
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
-    }
-
-    data = {
-        "model": "oss-20b",
-        "messages": [
-            {"role": "system", "content": "You are a security code reviewer for C files."},
-            {"role": "user", "content": f"Please analyze the following C file and identify potential vulnerabilities. "
-                                        f"Return the results in valid JSON format, including vulnerability type, "
-                                        f"location (line or function), severity, explanation, and suggested fix:\n\n{content}"}
-        ]
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=15)
-        if response.status_code == 200:
-            resultsFromLLM(response.json())
-            pass
-        else:
-            print(f"Error: {response.status_code}, {response.text}")
-            return None
-    except Exception as e:
-        print(f"Request failed: {e}")
-        return None
-    return response.json()
-"""
