@@ -35,8 +35,12 @@ import faiss
 import numpy as np
 
 # Local modules
-from config import RagConfig
-from resources import Resources
+try:
+    from .config import RagConfig
+    from .resources import Resources
+except ImportError:  # pragma: no cover
+    from config import RagConfig
+    from resources import Resources
 
 # IMPORTANT:
 # Avoid naming a local file "types.py" because it can collide with Python stdlib "types".
@@ -44,9 +48,12 @@ from resources import Resources
 # - preferred: rag_types.py
 # - legacy:    types.py (not recommended)
 try:
-    from rag_types import RAGDocument, RetrievedDocument, make_rag_document
+    from .rag_types import RAGDocument, RetrievedDocument, make_rag_document
 except ImportError:  # pragma: no cover
-    from types import RAGDocument, RetrievedDocument, make_rag_document  # type: ignore
+    try:
+        from rag_types import RAGDocument, RetrievedDocument, make_rag_document
+    except ImportError:
+        from types import RAGDocument, RetrievedDocument, make_rag_document  # type: ignore
 
 
 # ---------------------------
@@ -623,6 +630,12 @@ def build_index(cfg: RagConfig, resources: Resources, embedder: LocalEmbedder) -
 
     index = faiss.IndexFlatIP(embedder.dim)
     store = SqliteDocStore(cfg.sqlite_path)
+
+    # Rebuild mode: clear previous rows so faiss_id can start from 0 safely.
+    # This prevents UNIQUE constraint errors when running build multiple times
+    # against the same SQLite file.
+    store.conn.execute("DELETE FROM docs;")
+    store.commit()
 
     total_lines = 0
     indexed_docs = 0
