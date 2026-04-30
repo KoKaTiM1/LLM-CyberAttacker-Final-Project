@@ -40,6 +40,9 @@ class WorkflowState(Enum):
     VALIDATING_FILE = "validating_file"
     VALIDATION_SUCCESS = "validation_success"
     VALIDATION_FAILED = "validation_failed"
+    RAG_PROCESSING = "rag_processing"
+    RAG_SUCCESS = "rag_success"
+    RAG_FAILED = "rag_failed"
     ANALYZING_VULNERABILITY = "analyzing_vulnerability"
     ANALYSIS_SUCCESS = "analysis_success"
     ANALYSIS_FAILED = "analysis_failed"
@@ -60,6 +63,7 @@ class AgentContext:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.file_content = ""
+        self.user_query = ""
         self.vulnerability_data = {}
         self.llm_response = ""          # Raw LLM response
         self.attack_script = ""         # Script from Agent
@@ -177,6 +181,7 @@ class CyberAttackAgentWrapper:
         # Add nodes that wrap existing functions
         connection_node = workflow.add_node("check_connections", self.check_connections_step)
         validate_node = workflow.add_node("validate_file", self.validate_file_step)
+        rag_node = workflow.add_node("user_prompt", self.prompt_user_step)
         analyze_node = workflow.add_node("analyze_vulnerability", self.analyze_vulnerability_step)
         create_script_node = workflow.add_node("create_attack_script", self.create_attack_script_step)
         execute_sandbox_node = workflow.add_node("execute_in_sandbox", self.execute_in_sandbox_step)
@@ -192,8 +197,11 @@ class CyberAttackAgentWrapper:
         connection_node.add_conditional_edge("success", "validate_file")
         connection_node.add_conditional_edge("failed", "handle_error")
         
-        validate_node.add_conditional_edge("success", "analyze_vulnerability")
+        validate_node.add_conditional_edge("success", "user_prompt")
         validate_node.add_conditional_edge("failed", "handle_error")
+
+        rag_node.add_conditional_edge("success", "analyze_vulnerability")
+        rag_node.add_conditional_edge("failed", "handle_error")
         
         analyze_node.add_conditional_edge("success", "create_attack_script")
         analyze_node.add_conditional_edge("failed", "handle_error")
@@ -295,6 +303,60 @@ class CyberAttackAgentWrapper:
         except Exception as e:
             context.set_error(f"Vulnerability analysis failed: {e}", WorkflowState.ANALYSIS_FAILED)
         
+        return context
+
+    def prompt_user_step(self, context: AgentContext) -> AgentContext:
+        """Step 3: Run agentic RAG with a user query and enrich input for LLM review."""
+        context.log_step("Step 3: Running RAG node with user input...")
+        context.current_state = WorkflowState.RAG_PROCESSING
+
+        try:
+            # Prefer explicit query from env, then stdin, then fallback to file content.
+            query = os.getenv("RAG_USER_QUERY", "").strip()
+            if not query:
+                try:
+                    query = input("Enter RAG query (press Enter to use file content): ").strip()
+                except Exception:
+                    query = ""
+            if not query:
+                query = context.file_content
+
+            context.user_query = query
+
+            # Resolve data paths used by the RAG module.
+            project_root = Path(__file__).resolve().parents[2]
+            sqlite_path = project_root / "data" / "cve.db"
+            faiss_path = project_root / "data" / "cve.index"
+
+            rag_text = ""
+            if faiss_path.exists() and sqlite_path.exists():
+                from .rag.agent_rag import call_agentic_rag
+
+                rag_result = call_agentic_rag(
+                    user_query=query,
+                    sqlite_path=str(sqlite_path),
+                    faiss_path=str(faiss_path),
+                    model_name="all-MiniLM-L6-v2",
+                )
+                rag_text = (rag_result or {}).get("final_answer", "")
+                context.log_step("RAG node completed successfully")
+            else:
+                context.log_step(
+                    f"RAG data files missing ({sqlite_path.name} or {faiss_path.name}); continuing with original input"
+                )
+
+            if rag_text:
+                # Keep original C content and append RAG guidance for the LLM reviewer.
+                context.file_content = (
+                    f"{context.file_content}\n\n"
+                    f"[RAG Context]\n{rag_text}\n"
+                )
+
+            context.current_state = WorkflowState.RAG_SUCCESS
+
+        except Exception as e:
+            context.set_error(f"RAG node failed: {e}", WorkflowState.RAG_FAILED)
+
         return context
     
     def create_attack_script_step(self, context: AgentContext) -> AgentContext:

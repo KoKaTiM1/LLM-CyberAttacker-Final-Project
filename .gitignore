@@ -53,7 +53,7 @@ coverage.xml
 # Django stuff:
 *.log
 local_settings.py
-db.sqlite3
+# db.sqlite3
 
 # Flask stuff:
 instance/
@@ -117,7 +117,6 @@ dmypy.json
 
 # API Keys and sensitive data
 *.key
-config.py
 secrets.json
 sandbox_config.json
 
