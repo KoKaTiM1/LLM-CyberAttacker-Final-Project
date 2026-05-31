@@ -235,6 +235,17 @@ def validate_file_node(state: CyberState) -> CyberState:
     return _state_from_context(ctx)
 
 
+def rag_node(state: CyberState) -> CyberState:
+    """
+    Node 4b – Run agentic RAG to enrich file content before vulnerability analysis.
+    Only active in file mode; skipped automatically if RAG data files are missing.
+    """
+    ctx = _context_from_state(state)
+    ctx = _wrapper.prompt_user_step(ctx)
+    logger.info("rag_node executed, state=%s", ctx.current_state.value)
+    return _state_from_context(ctx)
+
+
 def analyze_vulnerability_node(state: CyberState) -> CyberState:
     """
     Node 5 – delegate to wrapper.analyze_vulnerability_step.
@@ -357,8 +368,15 @@ def route_after_build_prompt(state: CyberState) -> str:
 def route_after_validate_file(state: CyberState) -> str:
     """
     Router after validate_file_node.
-    For file mode: go directly to analyze_vulnerability
-    For CVE mode: this step is after build_prompt, so continue to analyze
+    File mode: go to rag_node to enrich context before analysis.
+    """
+    return "handle_error" if _has_error(state) else "rag"
+
+
+def route_after_rag(state: CyberState) -> str:
+    """
+    Router after rag_node.
+    RAG failures are non-fatal (the node logs and continues); proceed to analysis.
     """
     return "handle_error" if _has_error(state) else "analyze_vulnerability"
 
@@ -458,7 +476,7 @@ def build_cyber_attack_graph():
     CVE mode:  check_connections → load_cve → build_prompt → create_attack_script
                → execute_in_sandbox → [success: workflow_complete]
                → [failure: evaluate_attack_result → rebuild_prompt → create_attack_script (retry loop)]
-    File mode: check_connections → validate_file → analyze_vulnerability
+    File mode: check_connections → validate_file → rag → analyze_vulnerability
                → create_attack_script → execute_in_sandbox → [same retry loop]
     (handle_error is reachable from any stage)
     """
@@ -469,6 +487,7 @@ def build_cyber_attack_graph():
     workflow.add_node("load_cve", load_cve_node)
     workflow.add_node("build_prompt", build_prompt_node)
     workflow.add_node("validate_file", validate_file_node)
+    workflow.add_node("rag", rag_node)
     workflow.add_node("analyze_vulnerability", analyze_vulnerability_node)
     workflow.add_node("create_attack_script", create_attack_script_node)
     workflow.add_node("execute_in_sandbox", execute_in_sandbox_node)
@@ -501,6 +520,11 @@ def build_cyber_attack_graph():
     workflow.add_conditional_edges(
         "validate_file",
         route_after_validate_file,
+        ["rag", "handle_error"],
+    )
+    workflow.add_conditional_edges(
+        "rag",
+        route_after_rag,
         ["analyze_vulnerability", "handle_error"],
     )
     workflow.add_conditional_edges(
