@@ -2,7 +2,7 @@ import json
 import requests
 import re
 import logging
-from .model_config import OLLAMA_MODEL, OLLAMA_URL
+from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
 from .prompt_builder import build_exploit_prompt
 from .llm_utils import strip_thinking_tags
 
@@ -82,7 +82,7 @@ def generateExploitWithDynamicPrompt(vulnerability_data: dict, system_prompt: st
     logger.info(f"--- TASK PROMPT END ---")
     
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60000)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
         logger.info(f"Response Status: {response.status_code}")
 
         if response.status_code == 200:
@@ -137,7 +137,7 @@ def resultsFromLLM(LLMresult):
         logger.info(prompt)
         logger.info(f"--- PROMPT END ---")
 
-        response = requests.post(OLLAMA_URL, json=payload, timeout=60000)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
         logger.info(f"Response Status: {response.status_code}")
         if response.status_code == 200:
             response_data = response.json()

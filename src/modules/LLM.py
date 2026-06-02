@@ -2,7 +2,7 @@ from pathlib import Path
 import requests
 import logging
 from .Agent import resultsFromLLM
-from .model_config import OLLAMA_MODEL, OLLAMA_URL
+from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
 from .llm_utils import strip_thinking_tags
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ def checkConnectionWithOllama() -> bool:
             "stream": False
         }
         try:
-            response = requests.post(OLLAMA_URL, json=data, timeout=60000)
+            response = requests.post(OLLAMA_URL, json=data, timeout=OLLAMA_TIMEOUT_SECONDS)
             if response.status_code == 200:
                 print(f"Connected to {OLLAMA_MODEL} via Ollama.")
                 print(response.json())
@@ -86,7 +86,7 @@ def sendToLLMWithDynamicPrompt(system_prompt: str, user_prompt: str, model: str 
     logger.info(f"--- PROMPT END ---")
 
     try:
-        response = requests.post(OLLAMA_URL, json=data, timeout=60000)
+        response = requests.post(OLLAMA_URL, json=data, timeout=OLLAMA_TIMEOUT_SECONDS)
         logger.info(f"Response Status: {response.status_code}")
         if response.status_code == 200:
             ollama_response = response.json()
@@ -148,7 +148,7 @@ def sendToLLM(content):
     logger.info(data['prompt'])
     logger.info(f"--- PROMPT END ---")
     
-    response = requests.post(OLLAMA_URL, json=data, timeout=60000)
+    response = requests.post(OLLAMA_URL, json=data, timeout=OLLAMA_TIMEOUT_SECONDS)
     logger.info(f"Response Status: {response.status_code}")
     if response.status_code == 200:
         ollama_response = response.json()

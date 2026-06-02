@@ -28,6 +28,7 @@ from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
 from .sandbox import SandboxManager
+from .target_spec import build_file_target_spec, build_unresolved_cve_target_spec
 
 # Configure logging
 logging.basicConfig(
@@ -150,6 +151,17 @@ class WorkflowState(Enum):
     ANALYZING_VULNERABILITY = "analyzing_vulnerability"
     ANALYSIS_SUCCESS = "analysis_success"
     ANALYSIS_FAILED = "analysis_failed"
+    RESOLVING_CVE_TARGET = "resolving_cve_target"
+    CVE_TARGET_RESOLVED = "cve_target_resolved"
+    CVE_TARGET_FAILED = "cve_target_failed"
+    PLANNING_REPRODUCTION = "planning_reproduction"
+    REPRODUCTION_PLANNED = "reproduction_planned"
+    REPRODUCTION_UNRESOLVED = "reproduction_unresolved"
+    BUILDING_TARGET = "building_target"
+    TARGET_READY = "target_ready"
+    TARGET_UNRESOLVED = "target_unresolved"
+    TARGET_FAILED = "target_failed"
+    PREPARING_TARGET = "preparing_target"
     CREATING_SCRIPT = "creating_script"
     SCRIPT_SUCCESS = "script_success"
     SCRIPT_FAILED = "script_failed"
@@ -194,9 +206,13 @@ class AgentContext:
         self.file_path = Path(file_path) if file_path else None
         self.file_content = ""
         self.user_query = ""
+        self.rag_context = ""
         self.vulnerability_data = {}
         self.llm_response = ""          # Raw LLM response
         self.attack_script = ""         # Script from Agent
+        self.target_spec = {}
+        self.cve_target_info = {}
+        self.reproduction_plan = {}
         self.sandbox_result = ""        # Result from Sandbox execution
         self.attack_result = ""         # Result from attack execution
         self.error_message = ""
@@ -329,6 +345,10 @@ class CyberAttackAgentWrapper:
         validate_node = workflow.add_node("validate_file", self.validate_file_step)
         rag_node = workflow.add_node("user_prompt", self.prompt_user_step)
         analyze_node = workflow.add_node("analyze_vulnerability", self.analyze_vulnerability_step)
+        resolve_cve_node = workflow.add_node("resolve_cve_target", self.resolve_cve_target_step)
+        plan_repro_node = workflow.add_node("plan_reproduction", self.plan_reproduction_step)
+        build_target_node = workflow.add_node("build_target_artifact", self.build_target_artifact_step)
+        prepare_target_node = workflow.add_node("prepare_target_environment", self.prepare_target_environment_step)
         create_script_node = workflow.add_node("create_attack_script", self.create_attack_script_step)
         execute_sandbox_node = workflow.add_node("execute_in_sandbox", self.execute_in_sandbox_step)
         error_node = workflow.add_node("handle_error", self.handle_error_step)
@@ -346,7 +366,7 @@ class CyberAttackAgentWrapper:
         load_cve_node.add_conditional_edge("loaded", "build_dynamic_prompt")
         load_cve_node.add_conditional_edge("failed", "handle_error")
         
-        build_prompt_node.add_conditional_edge("built", "create_attack_script")
+        build_prompt_node.add_conditional_edge("built", "user_prompt")
         build_prompt_node.add_conditional_edge("failed", "handle_error")
         
         validate_node.add_conditional_edge("success", "user_prompt")
@@ -355,8 +375,22 @@ class CyberAttackAgentWrapper:
         rag_node.add_conditional_edge("success", "analyze_vulnerability")
         rag_node.add_conditional_edge("failed", "handle_error")
         
-        analyze_node.add_conditional_edge("success", "create_attack_script")
+        analyze_node.add_conditional_edge("success", "prepare_target_environment")
         analyze_node.add_conditional_edge("failed", "handle_error")
+
+        resolve_cve_node.add_conditional_edge("resolved", "plan_reproduction")
+        resolve_cve_node.add_conditional_edge("failed", "handle_error")
+
+        plan_repro_node.add_conditional_edge("planned", "build_target_artifact")
+        plan_repro_node.add_conditional_edge("unresolved", "workflow_complete")
+        plan_repro_node.add_conditional_edge("failed", "handle_error")
+
+        build_target_node.add_conditional_edge("ready", "create_attack_script")
+        build_target_node.add_conditional_edge("unresolved", "workflow_complete")
+        build_target_node.add_conditional_edge("failed", "handle_error")
+
+        prepare_target_node.add_conditional_edge("ready", "create_attack_script")
+        prepare_target_node.add_conditional_edge("failed", "handle_error")
         
         create_script_node.add_conditional_edge("success", "execute_in_sandbox")
         create_script_node.add_conditional_edge("failed", "handle_error")
@@ -594,20 +628,29 @@ class CyberAttackAgentWrapper:
         return context
 
     def prompt_user_step(self, context: AgentContext) -> AgentContext:
-        """Step 3: Run agentic RAG with a user query and enrich input for LLM review."""
-        context.log_step("Step 3: Running RAG node with user input...")
+        """Run agentic RAG and enrich the active file or CVE branch."""
+        context.log_step("Running RAG enrichment...")
         context.current_state = WorkflowState.RAG_PROCESSING
 
         try:
-            # Prefer explicit query from env, then stdin, then fallback to file content.
+            # Prefer explicit query from env, then derive a mode-specific query.
             query = os.getenv("RAG_USER_QUERY", "").strip()
             if not query:
-                try:
-                    query = input("Enter RAG query (press Enter to use file content): ").strip()
-                except Exception:
-                    query = ""
-            if not query:
-                query = context.file_content
+                if context.input_type == "cve" and context.cve_data:
+                    orchestrator = PromptOrchestrator()
+                    description = orchestrator._extract_description(context.cve_data) or ""
+                    query = " ".join(
+                        part
+                        for part in [
+                            context.cve_id or "",
+                            context.cwe_id or "",
+                            context.prompt_metadata.get("category", ""),
+                            description,
+                        ]
+                        if part
+                    )
+                else:
+                    query = context.file_content
 
             context.user_query = query
 
@@ -634,16 +677,190 @@ class CyberAttackAgentWrapper:
                 )
 
             if rag_text:
-                # Keep original C content and append RAG guidance for the LLM reviewer.
-                context.file_content = (
-                    f"{context.file_content}\n\n"
-                    f"[RAG Context]\n{rag_text}\n"
-                )
+                context.rag_context = rag_text
+                if context.input_type == "cve":
+                    context.user_prompt = f"{context.user_prompt}\n\n[RAG Context]\n{rag_text}\n"
+                else:
+                    # Keep original C content and append RAG guidance for the LLM reviewer.
+                    context.file_content = (
+                        f"{context.file_content}\n\n"
+                        f"[RAG Context]\n{rag_text}\n"
+                    )
 
             context.current_state = WorkflowState.RAG_SUCCESS
 
         except Exception as e:
-            context.set_error(f"RAG node failed: {e}", WorkflowState.RAG_FAILED)
+            context.log_step(f"RAG enrichment failed; continuing without RAG context: {e}")
+            context.rag_context = ""
+            context.current_state = WorkflowState.RAG_SUCCESS
+
+        return context
+
+    def _docker_base_image(self) -> str:
+        config_path = Path(__file__).parent.parent / "config" / "sandbox_config.json"
+        if not config_path.exists():
+            return "gcc:latest"
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        return (
+            config.get("environments", {})
+            .get("docker", {})
+            .get("image", "gcc:latest")
+        )
+
+    def _extract_cve_references(self, cve_data: Dict[str, Any]) -> List[str]:
+        refs = cve_data.get("references", [])
+        urls = []
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("url"):
+                urls.append(ref["url"])
+        return urls
+
+    def _extract_cpe_criteria(self, cve_data: Dict[str, Any]) -> List[str]:
+        criteria = []
+        for config in cve_data.get("configurations", []):
+            nodes = config.get("nodes", []) if isinstance(config, dict) else []
+            for node in nodes:
+                for match in node.get("cpeMatch", []):
+                    value = match.get("criteria")
+                    if value:
+                        criteria.append(value)
+        return criteria
+
+    def resolve_cve_target_step(self, context: AgentContext) -> AgentContext:
+        """Extract target reproduction evidence from CVE metadata and RAG context."""
+        context.log_step("Resolving CVE target details...")
+        context.current_state = WorkflowState.RESOLVING_CVE_TARGET
+
+        try:
+            if context.input_type != "cve" or not context.cve_data:
+                context.set_error("CVE target resolution requires loaded CVE data", WorkflowState.CVE_TARGET_FAILED)
+                return context
+
+            orchestrator = PromptOrchestrator()
+            description = orchestrator._extract_description(context.cve_data) or ""
+            references = self._extract_cve_references(context.cve_data)
+            cpe_criteria = self._extract_cpe_criteria(context.cve_data)
+            source_refs = [
+                url for url in references
+                if any(host in url.lower() for host in ["github.com", "gitlab.com", "sourceforge.net"])
+            ]
+
+            context.cve_target_info = {
+                "cve_id": context.cve_id,
+                "cwe_id": context.cwe_id,
+                "description": description,
+                "references": references,
+                "source_references": source_refs,
+                "cpe_criteria": cpe_criteria,
+                "rag_context": context.rag_context,
+                "missing_fields": [],
+            }
+
+            if not cpe_criteria:
+                context.cve_target_info["missing_fields"].append("affected_product_or_version")
+            if not source_refs:
+                context.cve_target_info["missing_fields"].append("source_or_build_reference")
+
+            context.current_state = WorkflowState.CVE_TARGET_RESOLVED
+            context.log_step(
+                f"CVE target evidence collected: {len(cpe_criteria)} CPE entries, "
+                f"{len(source_refs)} source/build references"
+            )
+        except Exception as e:
+            context.set_error(f"CVE target resolution failed: {e}", WorkflowState.CVE_TARGET_FAILED)
+
+        return context
+
+    def plan_reproduction_step(self, context: AgentContext) -> AgentContext:
+        """Decide whether a CVE can be reproduced automatically."""
+        context.log_step("Planning CVE reproduction...")
+        context.current_state = WorkflowState.PLANNING_REPRODUCTION
+
+        try:
+            missing = context.cve_target_info.get("missing_fields", [])
+            if missing:
+                context.reproduction_plan = {
+                    "strategy": "unresolved_cve",
+                    "reason": "insufficient_target_evidence",
+                    "missing_fields": missing,
+                }
+                context.current_state = WorkflowState.REPRODUCTION_UNRESOLVED
+                context.log_step(f"CVE reproduction unresolved: missing {', '.join(missing)}")
+                return context
+
+            # v1 is conservative: evidence is recorded, but automatic source builds
+            # are not attempted until package-specific builders exist.
+            context.reproduction_plan = {
+                "strategy": "unresolved_cve",
+                "reason": "no_automatic_builder_available",
+                "missing_fields": ["package_specific_builder"],
+            }
+            context.current_state = WorkflowState.REPRODUCTION_UNRESOLVED
+            context.log_step("CVE reproduction unresolved: no automatic builder available")
+        except Exception as e:
+            context.set_error(f"Reproduction planning failed: {e}", WorkflowState.TARGET_FAILED)
+
+        return context
+
+    def build_target_artifact_step(self, context: AgentContext) -> AgentContext:
+        """Create or record the target artifact described by the reproduction plan."""
+        context.log_step("Building target artifact...")
+        context.current_state = WorkflowState.BUILDING_TARGET
+
+        try:
+            strategy = context.reproduction_plan.get("strategy")
+            if strategy == "unresolved_cve":
+                context.target_spec = build_unresolved_cve_target_spec(
+                    cve_id=context.cve_id,
+                    cwe_id=context.cwe_id,
+                    docker_base_image=self._docker_base_image(),
+                    metadata={
+                        "target_info": context.cve_target_info,
+                        "reproduction_plan": context.reproduction_plan,
+                    },
+                ).to_dict()
+                context.sandbox_result = json.dumps(
+                    {
+                        "status": "unresolved_cve",
+                        "message": "CVE target could not be reproduced automatically",
+                        "target_spec": context.target_spec,
+                    },
+                    indent=2,
+                )
+                context.current_state = WorkflowState.TARGET_UNRESOLVED
+                context.log_step("Target artifact unresolved; skipping exploit generation")
+                return context
+
+            context.set_error(f"Unsupported reproduction strategy: {strategy}", WorkflowState.TARGET_FAILED)
+        except Exception as e:
+            context.set_error(f"Target artifact build failed: {e}", WorkflowState.TARGET_FAILED)
+
+        return context
+
+    def prepare_target_environment_step(self, context: AgentContext) -> AgentContext:
+        """Prepare a normalized target description for file-mode sandbox execution."""
+        context.log_step("Preparing file target environment...")
+        context.current_state = WorkflowState.PREPARING_TARGET
+
+        try:
+            if context.input_type != "file" or not context.file_path:
+                context.set_error("File target preparation requires a file input", WorkflowState.TARGET_FAILED)
+                return context
+
+            context.target_spec = build_file_target_spec(
+                file_path=str(context.file_path),
+                docker_base_image=self._docker_base_image(),
+            ).to_dict()
+            context.current_state = WorkflowState.TARGET_READY
+            context.log_step(
+                f"Target prepared: {context.target_spec['target_type']} "
+                f"using {context.target_spec['docker_base_image']}"
+            )
+        except Exception as e:
+            context.set_error(f"File target preparation failed: {e}", WorkflowState.TARGET_FAILED)
 
         return context
     
@@ -724,12 +941,27 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.EXECUTING_IN_SANDBOX
         
         try:
+            if context.target_spec and context.target_spec.get("target_type") == "unresolved_cve":
+                context.sandbox_result = json.dumps(
+                    {
+                        "status": "unresolved_cve",
+                        "message": "Skipping sandbox execution because no reproducible target is available",
+                        "target_spec": context.target_spec,
+                    },
+                    indent=2,
+                )
+                context.current_state = WorkflowState.SANDBOX_FAILED
+                context.log_step("Skipping sandbox execution: unresolved CVE target")
+                return context
+
             # Validate attack script exists
             if not context.attack_script:
                 context.set_error("No attack script available for execution", WorkflowState.SANDBOX_FAILED)
                 return context
             
             context.log_step(f"Attack script ready ({len(context.attack_script)} characters)")
+            if context.target_spec:
+                context.log_step(f"Using target spec: {context.target_spec.get('target_type')}")
             
             # Load sandbox configuration
             config_path = Path(__file__).parent.parent / "config" / "sandbox_config.json"
@@ -741,9 +973,14 @@ class CyberAttackAgentWrapper:
             # Create SandboxManager with config file (uses load_config internally)
             context.log_step("Initializing Sandbox Manager...")
             sandbox_manager = SandboxManager(config_file=str(config_path))
+            sandbox_manager.environments = {
+                name: env
+                for name, env in sandbox_manager.environments.items()
+                if name == "Docker_Container"
+            }
             
             if not sandbox_manager.environments:
-                context.set_error("No sandbox environments enabled in config", WorkflowState.SANDBOX_FAILED)
+                context.set_error("Docker sandbox environment is not enabled in config", WorkflowState.SANDBOX_FAILED)
                 return context
             
             enabled_envs = list(sandbox_manager.environments.keys())
@@ -775,10 +1012,37 @@ class CyberAttackAgentWrapper:
             
             # Execute exploit in all connected environments
             context.log_step("Executing attack script...")
-            results = sandbox_manager.execute_exploit(
-                exploit_script=context.attack_script,
-                vulnerability_data=context.vulnerability_data
-            )
+            if context.target_spec and context.target_spec.get("target_type") == "local_file":
+                source_path = context.target_spec.get("source_path")
+                remote_path = context.target_spec.get("container_target_path") or "/tmp/target"
+                upload_results = sandbox_manager.upload_vulnerable_file(source_path, remote_path)
+                if not any(upload_results.values()):
+                    context.set_error("Failed to stage target file in sandbox", WorkflowState.SANDBOX_FAILED)
+                    return context
+
+                script_type = "c" if str(context.attack_script).lstrip().startswith("#include") else "python"
+                target_result = sandbox_manager.generate_and_execute_attack(
+                    vulnerable_file_path=remote_path,
+                    attack_script=context.attack_script,
+                    script_type=script_type,
+                    vulnerability_data=context.vulnerability_data,
+                )
+                environment_results = target_result.get("environment_results", {})
+                results = {
+                    env_name: {
+                        "success": env_result.get("success", False),
+                        "execution_time": env_result.get("execution_time", 0),
+                        "output": env_result.get("output", ""),
+                        "error": env_result.get("error"),
+                        "exploitation_analysis": env_result.get("analysis", {}),
+                    }
+                    for env_name, env_result in environment_results.items()
+                }
+            else:
+                results = sandbox_manager.execute_exploit(
+                    exploit_script=context.attack_script,
+                    vulnerability_data=context.vulnerability_data
+                )
             
             # Store results
             context.sandbox_result = json.dumps(results, indent=2)

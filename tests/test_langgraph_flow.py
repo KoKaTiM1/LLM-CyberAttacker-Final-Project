@@ -145,9 +145,16 @@ def test_graph_structure():
             "load_cve",
             "build_prompt",
             "validate_file",
+            "rag",
             "analyze_vulnerability",
+            "prepare_target_environment",
+            "resolve_cve_target",
+            "plan_reproduction",
+            "build_target_artifact",
             "create_attack_script",
             "execute_in_sandbox",
+            "evaluate_attack_result",
+            "rebuild_prompt",
             "handle_error",
             "workflow_complete",
         ]
@@ -176,7 +183,7 @@ def test_graph_structure():
             ("__start__", "check_connections"),
             ("check_connections", "load_cve"),
             ("load_cve", "build_prompt"),
-            ("build_prompt", "create_attack_script"),
+            ("build_prompt", "rag"),
         ]
         
         for source, target in critical_edges:

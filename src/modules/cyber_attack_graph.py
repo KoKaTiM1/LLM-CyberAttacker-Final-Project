@@ -60,8 +60,12 @@ class CyberState(TypedDict, total=False):
     prompt_metadata: Dict[str, Any]  # Added: Orchestrator metadata
 
     # Analysis / exploitation artefacts
+    rag_context: str
     vulnerability_data: Dict[str, Any]
     llm_response: str
+    target_spec: Dict[str, Any]
+    cve_target_info: Dict[str, Any]
+    reproduction_plan: Dict[str, Any]
     attack_script: str
     sandbox_result: str
     attack_result: str
@@ -108,8 +112,12 @@ def _context_from_state(state: CyberState) -> AgentContext:
 
     # Copy simple data fields
     ctx.file_content = state.get("file_content", "")
+    ctx.rag_context = state.get("rag_context", "")
     ctx.vulnerability_data = state.get("vulnerability_data", {})
     ctx.llm_response = state.get("llm_response", "")
+    ctx.target_spec = state.get("target_spec", {})
+    ctx.cve_target_info = state.get("cve_target_info", {})
+    ctx.reproduction_plan = state.get("reproduction_plan", {})
     ctx.attack_script = state.get("attack_script", "")
     ctx.sandbox_result = state.get("sandbox_result", "")
     ctx.attack_result = state.get("attack_result", "")
@@ -157,6 +165,7 @@ def _state_from_context(ctx: AgentContext) -> CyberState:
         "input_type": getattr(ctx, "input_type", "unknown"),
         "file_path": str(getattr(ctx, "file_path", "")) if getattr(ctx, "file_path") else "",
         "file_content": getattr(ctx, "file_content", ""),
+        "rag_context": getattr(ctx, "rag_context", ""),
         "cve_id": getattr(ctx, "cve_id", ""),
         "cve_data": getattr(ctx, "cve_data"),
         "cwe_id": getattr(ctx, "cwe_id"),
@@ -165,6 +174,9 @@ def _state_from_context(ctx: AgentContext) -> CyberState:
         "prompt_metadata": getattr(ctx, "prompt_metadata", {}),
         "vulnerability_data": getattr(ctx, "vulnerability_data", {}),
         "llm_response": getattr(ctx, "llm_response", ""),
+        "target_spec": getattr(ctx, "target_spec", {}),
+        "cve_target_info": getattr(ctx, "cve_target_info", {}),
+        "reproduction_plan": getattr(ctx, "reproduction_plan", {}),
         "attack_script": getattr(ctx, "attack_script", ""),
         "sandbox_result": getattr(ctx, "sandbox_result", ""),
         "attack_result": getattr(ctx, "attack_result", ""),
@@ -266,6 +278,46 @@ def create_attack_script_node(state: CyberState) -> CyberState:
     return _state_from_context(ctx)
 
 
+def resolve_cve_target_node(state: CyberState) -> CyberState:
+    """
+    Node – collect CVE reproduction evidence from metadata and RAG context.
+    """
+    ctx = _context_from_state(state)
+    ctx = _wrapper.resolve_cve_target_step(ctx)
+    logger.info("resolve_cve_target_node executed, state=%s", ctx.current_state.value)
+    return _state_from_context(ctx)
+
+
+def plan_reproduction_node(state: CyberState) -> CyberState:
+    """
+    Node – decide whether the CVE can be reproduced automatically.
+    """
+    ctx = _context_from_state(state)
+    ctx = _wrapper.plan_reproduction_step(ctx)
+    logger.info("plan_reproduction_node executed, state=%s", ctx.current_state.value)
+    return _state_from_context(ctx)
+
+
+def build_target_artifact_node(state: CyberState) -> CyberState:
+    """
+    Node – build or record the target artifact described by the plan.
+    """
+    ctx = _context_from_state(state)
+    ctx = _wrapper.build_target_artifact_step(ctx)
+    logger.info("build_target_artifact_node executed, state=%s", ctx.current_state.value)
+    return _state_from_context(ctx)
+
+
+def prepare_target_environment_node(state: CyberState) -> CyberState:
+    """
+    Node – prepare file-mode target metadata for sandbox execution.
+    """
+    ctx = _context_from_state(state)
+    ctx = _wrapper.prepare_target_environment_step(ctx)
+    logger.info("prepare_target_environment_node executed, state=%s", ctx.current_state.value)
+    return _state_from_context(ctx)
+
+
 def execute_in_sandbox_node(state: CyberState) -> CyberState:
     """
     Node 7 – delegate to wrapper.execute_in_sandbox_step.
@@ -358,11 +410,9 @@ def route_after_load_cve(state: CyberState) -> str:
 def route_after_build_prompt(state: CyberState) -> str:
     """
     Router after build_prompt_node.
-    In CVE mode, skip validate_file and analyze_vulnerability —
-    all vulnerability info is already in the CVE data and prompts.
-    Go directly to create_attack_script.
+    CVE mode now goes through RAG before target reproduction planning.
     """
-    return "handle_error" if _has_error(state) else "create_attack_script"
+    return "handle_error" if _has_error(state) else "rag"
 
 
 def route_after_validate_file(state: CyberState) -> str:
@@ -376,16 +426,56 @@ def route_after_validate_file(state: CyberState) -> str:
 def route_after_rag(state: CyberState) -> str:
     """
     Router after rag_node.
-    RAG failures are non-fatal (the node logs and continues); proceed to analysis.
+    File mode proceeds to analysis; CVE mode proceeds to target resolution.
     """
-    return "handle_error" if _has_error(state) else "analyze_vulnerability"
+    if _has_error(state):
+        return "handle_error"
+    return "resolve_cve_target" if state.get("input_type") == "cve" else "analyze_vulnerability"
 
 
 def route_after_analyze(state: CyberState) -> str:
     """
     Router after analyze_vulnerability_node.
     """
+    return "handle_error" if _has_error(state) else "prepare_target_environment"
+
+
+def route_after_prepare_target(state: CyberState) -> str:
+    """
+    Router after prepare_target_environment_node.
+    """
     return "handle_error" if _has_error(state) else "create_attack_script"
+
+
+def route_after_resolve_cve_target(state: CyberState) -> str:
+    """
+    Router after resolve_cve_target_node.
+    """
+    return "handle_error" if _has_error(state) else "plan_reproduction"
+
+
+def route_after_plan_reproduction(state: CyberState) -> str:
+    """
+    Router after plan_reproduction_node.
+    """
+    if _has_error(state):
+        return "handle_error"
+    current = state.get("current_state", "")
+    if current == "reproduction_unresolved":
+        return "build_target_artifact"
+    return "build_target_artifact"
+
+
+def route_after_build_target_artifact(state: CyberState) -> str:
+    """
+    Router after build_target_artifact_node.
+    """
+    if _has_error(state):
+        return "handle_error"
+    current = state.get("current_state", "")
+    if current == "target_unresolved":
+        return "workflow_complete"
+    return "create_attack_script"
 
 
 def route_after_create_script(state: CyberState) -> str:
@@ -473,11 +563,15 @@ def build_cyber_attack_graph():
     and LangGraph only as the visual / orchestration layer.
     
     Flow:
-    CVE mode:  check_connections → load_cve → build_prompt → create_attack_script
+    CVE mode:  check_connections → load_cve → build_prompt → rag
+               → resolve_cve_target → plan_reproduction → build_target_artifact
+               → [resolved: create_attack_script]
+               → [unresolved: workflow_complete]
                → execute_in_sandbox → [success: workflow_complete]
                → [failure: evaluate_attack_result → rebuild_prompt → create_attack_script (retry loop)]
     File mode: check_connections → validate_file → rag → analyze_vulnerability
-               → create_attack_script → execute_in_sandbox → [same retry loop]
+               → prepare_target_environment → create_attack_script
+               → execute_in_sandbox → [same retry loop]
     (handle_error is reachable from any stage)
     """
     workflow = StateGraph(CyberState)
@@ -489,6 +583,10 @@ def build_cyber_attack_graph():
     workflow.add_node("validate_file", validate_file_node)
     workflow.add_node("rag", rag_node)
     workflow.add_node("analyze_vulnerability", analyze_vulnerability_node)
+    workflow.add_node("prepare_target_environment", prepare_target_environment_node)
+    workflow.add_node("resolve_cve_target", resolve_cve_target_node)
+    workflow.add_node("plan_reproduction", plan_reproduction_node)
+    workflow.add_node("build_target_artifact", build_target_artifact_node)
     workflow.add_node("create_attack_script", create_attack_script_node)
     workflow.add_node("execute_in_sandbox", execute_in_sandbox_node)
     workflow.add_node("evaluate_attack_result", evaluate_attack_result_node)
@@ -515,7 +613,7 @@ def build_cyber_attack_graph():
     workflow.add_conditional_edges(
         "build_prompt",
         route_after_build_prompt,
-        ["create_attack_script", "handle_error"],
+        ["rag", "handle_error"],
     )
     workflow.add_conditional_edges(
         "validate_file",
@@ -525,12 +623,32 @@ def build_cyber_attack_graph():
     workflow.add_conditional_edges(
         "rag",
         route_after_rag,
-        ["analyze_vulnerability", "handle_error"],
+        ["analyze_vulnerability", "resolve_cve_target", "handle_error"],
     )
     workflow.add_conditional_edges(
         "analyze_vulnerability",
         route_after_analyze,
+        ["prepare_target_environment", "handle_error"],
+    )
+    workflow.add_conditional_edges(
+        "prepare_target_environment",
+        route_after_prepare_target,
         ["create_attack_script", "handle_error"],
+    )
+    workflow.add_conditional_edges(
+        "resolve_cve_target",
+        route_after_resolve_cve_target,
+        ["plan_reproduction", "handle_error"],
+    )
+    workflow.add_conditional_edges(
+        "plan_reproduction",
+        route_after_plan_reproduction,
+        ["build_target_artifact", "handle_error"],
+    )
+    workflow.add_conditional_edges(
+        "build_target_artifact",
+        route_after_build_target_artifact,
+        ["create_attack_script", "workflow_complete", "handle_error"],
     )
     workflow.add_conditional_edges(
         "create_attack_script",

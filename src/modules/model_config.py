@@ -1,5 +1,8 @@
+import os
+
 OLLAMA_MODEL = "huihui_ai/deepseek-r1-abliterated:14b-qwen-distill"
 OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
 
 MODEL_PROFILES = {
     "huihui_ai/deepseek-r1-abliterated:14b-qwen-distill": {
