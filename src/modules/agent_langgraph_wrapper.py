@@ -17,6 +17,7 @@ The workflow orchestrates the existing components:
 from pathlib import Path
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Dict, Any, Callable, List, Optional
 from enum import Enum
@@ -348,7 +349,6 @@ class CyberAttackAgentWrapper:
         build_prompt_node.add_conditional_edge("built", "create_attack_script")
         build_prompt_node.add_conditional_edge("failed", "handle_error")
         
-        validate_node.add_conditional_edge("success", "analyze_vulnerability")
         validate_node.add_conditional_edge("success", "user_prompt")
         validate_node.add_conditional_edge("failed", "handle_error")
 
