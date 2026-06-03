@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 # LLM Setup for Ollama (local, no API key needed)
 from langchain_ollama import ChatOllama
 
-DEFAULT_OLLAMA_MODEL = os.getenv("RAG_LLM_MODEL", "gpt-oss:20b")
+DEFAULT_OLLAMA_MODEL = os.getenv("RAG_LLM_MODEL", "llama3.2:1b")
 
 
 def get_llm(model_name: Optional[str] = None):

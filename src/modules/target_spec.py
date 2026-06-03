@@ -29,8 +29,43 @@ class TargetSpec:
         return asdict(self)
 
 
-def build_file_target_spec(file_path: str, docker_base_image: str = "gcc:latest") -> TargetSpec:
-    is_c_file = file_path.lower().endswith(".c")
+def _detect_source_language(file_path: str, file_content: Optional[str] = None) -> str:
+    normalized_path = file_path.lower()
+    if normalized_path.endswith((".c", ".h")):
+        return "c"
+
+    if not file_content:
+        return "text"
+
+    content = file_content.strip()
+    if not content:
+        return "text"
+
+    c_markers = [
+        "#include",
+        "int main(",
+        "void main(",
+        "printf(",
+        "scanf(",
+        "strcpy(",
+        "strlen(",
+        "char ",
+        "return ",
+    ]
+    score = sum(1 for marker in c_markers if marker in content)
+    if score >= 2 and "{" in content and "}" in content and ";" in content:
+        return "c"
+
+    return "text"
+
+
+def build_file_target_spec(
+    file_path: str,
+    docker_base_image: str = "gcc:latest",
+    file_content: Optional[str] = None,
+) -> TargetSpec:
+    source_language = _detect_source_language(file_path, file_content)
+    is_c_file = source_language == "c"
     container_target_path = "/tmp/target.c" if is_c_file else "/tmp/target.txt"
 
     return TargetSpec(
@@ -45,7 +80,10 @@ def build_file_target_spec(file_path: str, docker_base_image: str = "gcc:latest"
         run_command="/tmp/target" if is_c_file else None,
         build_strategy="use_existing_file",
         artifact_paths=[file_path],
-        metadata={"source_language": "c" if is_c_file else "text"},
+        metadata={
+            "source_language": source_language,
+            "source_filename": file_path,
+        },
     )
 
 
@@ -64,4 +102,33 @@ def build_unresolved_cve_target_spec(
         docker_base_image=docker_base_image,
         build_strategy="needs_reproduction_plan",
         metadata=metadata or {},
+    )
+
+
+def build_cve_tool_target_spec(
+    *,
+    cve_id: str,
+    cwe_id: Optional[str],
+    tool_name: str,
+    executable_path: str,
+    docker_base_image: str = "gcc:latest",
+    setup_commands: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> TargetSpec:
+    return TargetSpec(
+        mode="cve",
+        target_type="cve_system_binary",
+        cve_id=cve_id,
+        cwe_id=cwe_id,
+        docker_base_image=docker_base_image,
+        container_target_path=executable_path,
+        run_command=executable_path,
+        build_strategy="run_system_binary_exploit",
+        artifact_paths=[],
+        metadata={
+            "tool_name": tool_name,
+            "executable_path": executable_path,
+            "setup_commands": setup_commands or [],
+            **(metadata or {}),
+        },
     )

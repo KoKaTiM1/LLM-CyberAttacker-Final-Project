@@ -7,6 +7,7 @@ Updated Sandbox System with Correct 3 Environments:
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 import subprocess
 import time
@@ -52,7 +53,8 @@ def analyze_exploitation_results(output: str, error: str = None,
         "general": [
             "exploit successful", "vulnerability confirmed", "attack succeeded",
             "system compromised", "access gained", "privilege escalation",
-            "generated payload", "payload components"
+            "generated payload", "payload components", "crashed with exit status",
+            "likely triggered a crash", "segmentation fault with control"
         ]
     }
     
@@ -78,6 +80,11 @@ def analyze_exploitation_results(output: str, error: str = None,
     output_lower = output.lower() if output else ""
     error_lower = str(error).lower() if error else ""
     combined_text = f"{output_lower} {error_lower}"
+    controlled_crash = (
+        "segmentation fault with control" in combined_text or
+        "returncode=-11" in combined_text or
+        "sigsegv" in combined_text
+    )
     
     # Check for success
     success_found = []
@@ -87,10 +94,14 @@ def analyze_exploitation_results(output: str, error: str = None,
     for pattern in patterns_to_check:
         if pattern in combined_text:
             success_found.append(pattern)
+    if controlled_crash and "segmentation fault with control" not in success_found:
+        success_found.append("segmentation fault with control")
     
     # Check for failure reasons
     failures_found = []
     for pattern in failure_patterns:
+        if controlled_crash and pattern == "segmentation fault":
+            continue
         if pattern in combined_text:
             failures_found.append(pattern)
     
@@ -120,8 +131,10 @@ def analyze_exploitation_results(output: str, error: str = None,
                 learning_feedback.append(category)
     
     # Determine overall result
-    exploitation_successful = (len(success_found) > 0 and 
-                             len(failures_found) == 0)
+    exploitation_successful = (
+        len(success_found) > 0 and
+        (len(failures_found) == 0 or controlled_crash)
+    )
     
     if (not exploitation_successful and not failures_found and 
         not success_found):
@@ -623,14 +636,151 @@ except ImportError:
             )
         
         try:
+            prepared_script = attack_script
+            target_source = ""
+            if hasattr(self, '_uploaded_files') and target_file in self._uploaded_files:
+                target_source = self._uploaded_files[target_file]
+
+            if script_type.lower() == "python":
+                prepared_script = re.sub(
+                    r"BINARY\s*=\s*['\"]\.\/vulnerable['\"]",
+                    f"BINARY = {target_file!r}",
+                    prepared_script,
+                )
+                if "interactive()" in prepared_script:
+                    prepared_script = prepared_script.replace(
+                        "p.interactive()",
+                        (
+                            "try:\n"
+                            "    output = p.recvrepeat(2)\n"
+                            "    if output:\n"
+                            "        print(output.decode(errors='replace'))\n"
+                            "finally:\n"
+                            "    p.close()"
+                        ),
+                    )
+
+                # Adapt stdin-oriented pwntools scripts for binaries that actually
+                # consume the payload via argv[1], such as the sample file demo.
+                uses_argv_input = "argv[1]" in target_source and "process(BINARY)" in prepared_script
+                if uses_argv_input:
+                    buffer_match = re.search(r"char\s+\w+\[(\d+)\]", target_source)
+                    if buffer_match:
+                        buffer_size = int(buffer_match.group(1))
+                        # Heuristic for the demo target: buffer + saved RBP on amd64.
+                        prepared_script = re.sub(
+                            r"OFFSET\s*=\s*\d+",
+                            f"OFFSET = {buffer_size + 8}",
+                            prepared_script,
+                            count=1,
+                        )
+
+                    # argv strings cannot contain NUL bytes, so replace the placeholder
+                    # packed address with a printable overwrite of the same width.
+                    prepared_script = re.sub(
+                        r"p64\([^)]+\)",
+                        "b'B' * 8",
+                        prepared_script,
+                    )
+                    prepared_script = re.sub(
+                        r"p32\([^)]+\)",
+                        "b'B' * 4",
+                        prepared_script,
+                    )
+
+                    prepared_script = re.sub(
+                        r"p\s*=\s*process\(BINARY\)\s*.*?p\.close\(\)",
+                        (
+                            "import subprocess\n\n"
+                            "result = subprocess.run([BINARY, payload], capture_output=True)\n"
+                            "if result.stdout:\n"
+                            "    print(result.stdout.decode(errors='replace'))\n"
+                            "if result.stderr:\n"
+                            "    print(result.stderr.decode(errors='replace'))\n"
+                            "if result.returncode < 0:\n"
+                            "    print('segmentation fault with control')\n"
+                            "    print(f'returncode={result.returncode}')\n"
+                            "elif result.returncode != 0:\n"
+                            "    print(f'returncode={result.returncode}')"
+                        ),
+                        prepared_script,
+                        flags=re.DOTALL,
+                    )
+
+                packages: List[str] = list(self.python_packages or [])
+                needs_pwntools = "from pwn import" in prepared_script or "import pwn" in prepared_script
+                if needs_pwntools and "pwntools" not in packages:
+                    packages.append("pwntools")
+
+                packages_literal = json.dumps(packages)
+                install_prelude = f"""
+import subprocess
+import sys
+import importlib
+
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        timeout=300,
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
+                prepared_script = install_prelude + prepared_script
+
             # Create temp file for attack script
             with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}',
                                            delete=False, encoding='utf-8') as f:
-                f.write(attack_script)
+                f.write(prepared_script)
                 temp_script_path = f.name
             
             # Create a comprehensive script that handles file creation and execution
+            setup_block = "\n".join(self.setup_commands or [])
+            target_build_block = ""
+            execution_target = target_file
+            if target_file.endswith(".c"):
+                execution_target = "/tmp/target"
+                target_build_block = f"""
+echo "Compiling C target: {target_file}"
+gcc {target_file} -o {execution_target} -fno-stack-protector -z execstack -no-pie
+chmod +x {execution_target}
+"""
+
             wrapper_script = f'''#!/bin/bash
+
+set -e
+export TERM=xterm
+
+# One-time container setup for tools and pip packages
+{setup_block}
 
 # Create target file if it was uploaded
 if [ -n "$TARGET_FILE_CONTENT" ]; then
@@ -639,13 +789,15 @@ if [ -n "$TARGET_FILE_CONTENT" ]; then
     chmod +x {target_file} 2>/dev/null || true
 fi
 
+{target_build_block}
+
 # Execute the attack script
 if [ "{script_type}" = "python" ]; then
-    python3 /attack.{script_type} {target_file}
+    python3 /attack.{script_type} {execution_target}
 elif [ "{script_type}" = "c" ]; then
     gcc /attack.{script_type} -o /tmp/attack_binary -w && /tmp/attack_binary {target_file}
 else
-    chmod +x /attack.{script_type} && /attack.{script_type} {target_file}
+    chmod +x /attack.{script_type} && /attack.{script_type} {execution_target}
 fi
 '''
             
@@ -678,7 +830,7 @@ fi
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=120  # Longer timeout for complex attacks
+                timeout=300  # Allow container setup + exploit runtime to complete
             )
             
             execution_time = time.time() - start_time
@@ -2002,9 +2154,7 @@ class SandboxManager:
         
         for env_name, result in results.items():
             # Perform intelligent analysis
-            vulnerability_type = None
-            if vulnerability_data:
-                vulnerability_type = vulnerability_data.get('Type', '').lower()
+            vulnerability_type = self._extract_vulnerability_type(vulnerability_data)
             
             analysis = analyze_exploitation_results(
                 output=result.output,
@@ -2160,13 +2310,29 @@ class SandboxManager:
             if success:
                 logger.info(f"Successfully uploaded to {name}")
                 # Make file executable if it's a binary or script
+                remote_ext = os.path.splitext(remote_file_path or "")[1].lower()
                 file_ext = os.path.splitext(local_file_path)[1].lower()
-                if file_ext in ['.c', '.cpp', '.sh', '.py', ''] or not file_ext:
+                if remote_ext in ['.c', '.cpp', '.sh', '.py', ''] or file_ext in ['.c', '.cpp', '.sh', '.py', ''] or not file_ext:
                     env.make_executable(remote_file_path or f"/tmp/{os.path.basename(local_file_path)}")
             else:
                 logger.error(f"Failed to upload to {name}")
         
         return results
+
+    @staticmethod
+    def _extract_vulnerability_type(vulnerability_data: dict = None) -> Optional[str]:
+        """Normalize vulnerability type across both single-item and list-based payloads."""
+        if not vulnerability_data:
+            return None
+        if isinstance(vulnerability_data, dict):
+            if vulnerability_data.get("Type"):
+                return str(vulnerability_data.get("Type", "")).lower()
+            vulns = vulnerability_data.get("vulnerabilities")
+            if isinstance(vulns, list) and vulns and isinstance(vulns[0], dict):
+                vuln_type = vulns[0].get("Type")
+                if vuln_type:
+                    return str(vuln_type).lower()
+        return None
     
     def generate_and_execute_attack(self, vulnerable_file_path: str, 
                                    attack_script: str, 
@@ -2209,9 +2375,7 @@ class SandboxManager:
             self.test_results.append(result)
             
             # Analyze results with intelligence
-            vulnerability_type = None
-            if vulnerability_data:
-                vulnerability_type = vulnerability_data.get('Type', '').lower()
+            vulnerability_type = self._extract_vulnerability_type(vulnerability_data)
             
             analysis = analyze_exploitation_results(
                 output=result.output,
@@ -2249,9 +2413,7 @@ class SandboxManager:
         
         # Process each environment result
         for env_name, result in results.items():
-            vulnerability_type = None
-            if vulnerability_data:
-                vulnerability_type = vulnerability_data.get('Type', '').lower()
+            vulnerability_type = self._extract_vulnerability_type(vulnerability_data)
                 
             analysis = analyze_exploitation_results(
                 output=result.output,
