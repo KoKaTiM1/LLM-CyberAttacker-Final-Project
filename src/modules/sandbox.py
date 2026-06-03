@@ -17,6 +17,7 @@ import argparse
 import tempfile
 import os
 from datetime import datetime
+from .model_config import SANDBOX_COMMAND_TIMEOUT_SECONDS
 
 # Configure logging
 logging.basicConfig(
@@ -370,26 +371,35 @@ _ensure_sandbox_packages()
 
 """
 
+            wrapper_path = None
+
             # Write combined script (installer + user code) to a temp file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
                 f.write(install_prelude + script_content)
                 temp_script_path = f.name
 
             try:
-                # Build shell pipeline inside container:
-                #   cd /tmp && <setup_commands> && python3 /script.py
-                shell_parts: List[str] = ["cd /tmp"]
-                if self.setup_commands:
-                    shell_parts.extend(self.setup_commands)
-                shell_parts.append("python3 /script.py")
-                shell_cmd = " && ".join(shell_parts)
+                setup_block = "\n".join(self.setup_commands or [])
+                wrapper_script = f"""#!/bin/bash
+set -e
+cd /tmp
+{setup_block}
+python3 /script.py
+"""
+
+                with tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.sh', delete=False, newline='\n'
+                ) as wrapper_file:
+                    wrapper_file.write(wrapper_script)
+                    wrapper_path = wrapper_file.name
 
                 docker_cmd = [
                     self.docker_command, "run", "--rm",
                     "-v", f"{temp_script_path}:/script.py",
+                    "-v", f"{wrapper_path}:/wrapper.sh",
                     "-w", "/tmp",
                     self.image,
-                    "bash", "-lc", shell_cmd,
+                    "bash", "/wrapper.sh",
                 ]
 
                 result = subprocess.run(
@@ -398,7 +408,7 @@ _ensure_sandbox_packages()
                     text=True,
                     encoding='utf-8',
                 errors='replace',
-                timeout=300
+                timeout=SANDBOX_COMMAND_TIMEOUT_SECONDS
                 )
 
                 execution_time = time.time() - start_time
@@ -415,6 +425,11 @@ _ensure_sandbox_packages()
                     os.unlink(temp_script_path)
                 except Exception:
                     pass
+                if wrapper_path:
+                    try:
+                        os.unlink(wrapper_path)
+                    except Exception:
+                        pass
 
         except Exception as e:
             execution_time = time.time() - start_time
@@ -741,7 +756,7 @@ def _ensure_sandbox_packages():
                         text=True,
                         encoding='utf-8',
                         errors='replace',
-                        timeout=300,
+                        timeout=SANDBOX_COMMAND_TIMEOUT_SECONDS,
                     )
                     if result.returncode == 0:
                         break
@@ -830,7 +845,7 @@ fi
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=300  # Allow container setup + exploit runtime to complete
+                timeout=SANDBOX_COMMAND_TIMEOUT_SECONDS
             )
             
             execution_time = time.time() - start_time
