@@ -3,7 +3,7 @@ import requests
 import logging
 from .Agent import resultsFromLLM
 from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
-from .llm_utils import strip_thinking_tags
+from .llm_utils import strip_thinking_tags, build_ollama_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,13 @@ def sendToLLMWithDynamicPrompt(system_prompt: str, user_prompt: str, model: str 
                         response_text = response_text[:-3]
 
                 ollama_response['response'] = response_text.strip()
+                ollama_response['metrics'] = build_ollama_metrics(
+                    stage="cve_analysis",
+                    model=model,
+                    prompt_text=combined_prompt,
+                    response_text=ollama_response['response'],
+                    response_payload=ollama_response,
+                )
                 logger.info(f"--- LLM RESPONSE START ---")
                 logger.info(ollama_response['response'])
                 logger.info(f"--- LLM RESPONSE END ---")
@@ -164,6 +171,13 @@ def sendToLLM(content):
                     response_text = response_text[:-3]
 
             ollama_response['response'] = response_text.strip()
+            ollama_response['metrics'] = build_ollama_metrics(
+                stage="file_analysis",
+                model=OLLAMA_MODEL,
+                prompt_text=data['prompt'],
+                response_text=ollama_response['response'],
+                response_payload=ollama_response,
+            )
             logger.info(f"--- LLM RESPONSE START ---")
             logger.info(ollama_response['response'])
             logger.info(f"--- LLM RESPONSE END ---")

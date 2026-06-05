@@ -10,6 +10,8 @@ class TargetSpec:
 
     mode: str
     target_type: str
+    target_family: str = "local_c_source"
+    image_strategy: str = "compiler_image"
     source_path: Optional[str] = None
     cve_id: Optional[str] = None
     cwe_id: Optional[str] = None
@@ -71,6 +73,8 @@ def build_file_target_spec(
     return TargetSpec(
         mode="file",
         target_type="local_file",
+        target_family="local_c_source",
+        image_strategy="compiler_image",
         source_path=file_path,
         docker_base_image=docker_base_image,
         container_target_path=container_target_path,
@@ -97,6 +101,8 @@ def build_unresolved_cve_target_spec(
     return TargetSpec(
         mode="cve",
         target_type="unresolved_cve",
+        target_family=(metadata or {}).get("target_family", "unresolved"),
+        image_strategy=(metadata or {}).get("image_strategy", "unresolved"),
         cve_id=cve_id,
         cwe_id=cwe_id,
         docker_base_image=docker_base_image,
@@ -111,6 +117,8 @@ def build_cve_tool_target_spec(
     cwe_id: Optional[str],
     tool_name: str,
     executable_path: str,
+    target_family: str = "system_package_tool",
+    image_strategy: str = "package_image",
     docker_base_image: str = "gcc:latest",
     setup_commands: Optional[List[str]] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -118,6 +126,8 @@ def build_cve_tool_target_spec(
     return TargetSpec(
         mode="cve",
         target_type="cve_system_binary",
+        target_family=target_family,
+        image_strategy=image_strategy,
         cve_id=cve_id,
         cwe_id=cwe_id,
         docker_base_image=docker_base_image,
@@ -132,3 +142,68 @@ def build_cve_tool_target_spec(
             **(metadata or {}),
         },
     )
+
+
+def classify_cve_target_family(
+    *,
+    description: str,
+    primary_target: Optional[Dict[str, Any]],
+    references: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Infer the broad target family and default Docker image strategy."""
+
+    description_lower = (description or "").lower()
+    refs_lower = " ".join(references or []).lower()
+    target_type = (primary_target or {}).get("target_type") or ""
+    vendor = ((primary_target or {}).get("vendor") or "").lower()
+    product = ((primary_target or {}).get("product") or "").lower()
+
+    kernel_markers = [
+        "linux kernel",
+        "kernel driver",
+        "kernel ",
+        "tcp_v6_syn_recv_sock",
+        "net/ipv6/",
+        "android for msm",
+        "with all android releases from caf using the linux kernel",
+    ]
+    if target_type == "o" or any(marker in description_lower for marker in kernel_markers):
+        return {
+            "target_family": "kernel_level",
+            "image_strategy": "requires_kernel_environment",
+            "docker_base_image": "debian:bookworm-slim",
+        }
+
+    runtime_products = {"php", "php_zip", "pierrejoye"}
+    if product in runtime_products or vendor in runtime_products or "php" in description_lower or "php" in refs_lower:
+        return {
+            "target_family": "language_runtime",
+            "image_strategy": "runtime_image",
+            "docker_base_image": "php:8.2-cli",
+        }
+
+    media_products = {"imagemagick", "libfpx", "ffmpeg", "wildmidi", "cimg"}
+    if (
+        product in media_products
+        or vendor in media_products
+        or any(name in description_lower for name in media_products)
+        or any(name in refs_lower for name in media_products)
+    ):
+        return {
+            "target_family": "media_stack",
+            "image_strategy": "package_image",
+            "docker_base_image": "debian:bookworm-slim",
+        }
+
+    if target_type == "a":
+        return {
+            "target_family": "system_package_tool",
+            "image_strategy": "package_image",
+            "docker_base_image": "debian:bookworm-slim",
+        }
+
+    return {
+        "target_family": "unresolved",
+        "image_strategy": "unresolved",
+        "docker_base_image": "debian:bookworm-slim",
+    }

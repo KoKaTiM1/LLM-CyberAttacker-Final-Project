@@ -20,6 +20,7 @@ Dependencies:
 """
 
 from __future__ import annotations
+from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
 
 import os
 import re
@@ -37,6 +38,7 @@ from pydantic import BaseModel, Field
 
 # LLM Setup for Ollama (local, no API key needed)
 from langchain_ollama import ChatOllama
+from ..llm_utils import approximate_token_count, build_langchain_metrics, merge_metric_totals
 
 DEFAULT_OLLAMA_MODEL = os.getenv("RAG_LLM_MODEL", "llama3.2:1b")
 
@@ -49,9 +51,10 @@ def get_llm(model_name: Optional[str] = None):
     Note: Make sure Ollama is running before using this!
     """
     return ChatOllama(
-        model=model_name or DEFAULT_OLLAMA_MODEL,
-        base_url="http://localhost:11434",
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_URL,
         temperature=0,
+        timeout=OLLAMA_TIMEOUT_SECONDS,
     )
 
 
@@ -461,6 +464,9 @@ def call_agentic_rag(
 
     # Extract final answer
     final_answer = ""
+    rag_context_text = ""
+    metrics_total: Dict[str, Any] = {}
+    final_answer_metrics: Dict[str, Any] = {}
     if isinstance(final_state, dict):
         messages = final_state.get("messages", [])
     else:
@@ -469,12 +475,36 @@ def call_agentic_rag(
     for msg in messages:
         if isinstance(msg, AIMessage):
             final_answer = msg.content
-        # You can parse CVE IDs from context if needed
+            metric = build_langchain_metrics(
+                stage="rag_llm_step",
+                model=llm_model_name or DEFAULT_OLLAMA_MODEL,
+                response_text=msg.content,
+                message=msg,
+            )
+            metrics_total = merge_metric_totals(metrics_total, metric)
+            final_answer_metrics = metric
+        elif isinstance(msg, ToolMessage):
+            rag_context_text += f"{msg.content}\n"
+
+    rag_context_tokens = approximate_token_count(rag_context_text)
+    query_tokens = approximate_token_count(user_query)
+    rag_metrics = {
+        "query_tokens": query_tokens,
+        "retrieved_context_tokens": rag_context_tokens,
+        "answer_tokens": final_answer_metrics.get("response_tokens", 0),
+        "tokens_per_second": final_answer_metrics.get("tokens_per_second", 0),
+        "model": llm_model_name or DEFAULT_OLLAMA_MODEL,
+        "prompt_tokens": final_answer_metrics.get("prompt_tokens", 0),
+        "response_tokens": metrics_total.get("response_tokens", 0),
+        "total_context_tokens": final_answer_metrics.get("total_context_tokens", 0),
+        "llm_totals": metrics_total,
+    }
     
     return {
         "final_answer": final_answer,
         "messages": messages,
         "conversation_length": len(messages),
+        "metrics": rag_metrics,
     }
 
 

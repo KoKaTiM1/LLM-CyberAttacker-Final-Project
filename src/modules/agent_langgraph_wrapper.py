@@ -28,10 +28,12 @@ from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
 from .sandbox import SandboxManager
+from .llm_utils import format_metric_log, merge_metric_totals
 from .target_spec import (
     build_cve_tool_target_spec,
     build_file_target_spec,
     build_unresolved_cve_target_spec,
+    classify_cve_target_family,
 )
 
 # Configure logging
@@ -51,6 +53,51 @@ REFUSAL_PATTERNS = [
 ]
 
 VULNERABILITY_JSON_KEYS = ["Type", "Location", "Severity", "Explanation", "SuggestedFix"]
+
+USPACE_TOOL_CATALOG: Dict[str, Dict[str, str]] = {
+    "unzip": {
+        "package_name": "unzip",
+        "tool_name": "unzip",
+        "executable_path": "/usr/bin/unzip",
+        "docker_base_image": "debian:bookworm-slim",
+    },
+    "wildmidi": {
+        "package_name": "wildmidi",
+        "tool_name": "wildmidi",
+        "executable_path": "/usr/bin/wildmidi",
+        "docker_base_image": "debian:bookworm-slim",
+    },
+    "ffmpeg": {
+        "package_name": "ffmpeg",
+        "tool_name": "ffmpeg",
+        "executable_path": "/usr/bin/ffmpeg",
+        "docker_base_image": "debian:bookworm-slim",
+    },
+    "imagemagick": {
+        "package_name": "imagemagick",
+        "tool_name": "imagemagick",
+        "executable_path": "/usr/bin/convert",
+        "docker_base_image": "debian:bookworm-slim",
+    },
+    "irssi": {
+        "package_name": "irssi",
+        "tool_name": "irssi",
+        "executable_path": "/usr/bin/irssi",
+        "docker_base_image": "debian:bookworm-slim",
+    },
+    "php": {
+        "package_name": "php",
+        "tool_name": "php",
+        "executable_path": "/usr/local/bin/php",
+        "docker_base_image": "php:8.2-cli",
+    },
+    "php_zip": {
+        "package_name": "php-zip",
+        "tool_name": "php",
+        "executable_path": "/usr/local/bin/php",
+        "docker_base_image": "php:8.2-cli",
+    },
+}
 
 
 def _normalize_text(text: str) -> str:
@@ -432,6 +479,12 @@ class AgentContext:
         self.current_state = WorkflowState.INITIALIZED
         self.execution_log = []
         self.connections_ok = False
+        self.metrics = {
+            "rag": {},
+            "main_analysis": {},
+            "script_generation": {},
+            "totals": {},
+        }
         
         # New fields for CVE and dynamic prompts
         self.cve_id = cve_id            # CVE identifier (e.g., "CVE-2024-1234")
@@ -457,6 +510,13 @@ class AgentContext:
         self.error_message = error_message
         self.current_state = state
         logging.error(f" {error_message}")
+
+    def record_metric(self, bucket: str, metric: Dict[str, Any]):
+        """Store metrics and update workflow totals."""
+        if not metric:
+            return
+        self.metrics[bucket] = metric
+        self.metrics["totals"] = merge_metric_totals(self.metrics.get("totals"), metric)
 
 
 class WorkflowNode:
@@ -768,6 +828,12 @@ class CyberAttackAgentWrapper:
                 
                 response_text = llm_response['response']
                 context.llm_response = response_text
+                metric = llm_response.get("metrics", {})
+                if metric:
+                    metric["rag_context_tokens"] = metric.get("rag_context_tokens", 0)
+                    context.record_metric("main_analysis", metric)
+                    context.log_step(format_metric_log("📊 Main analysis metrics", metric))
+                    context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
                 
                 try:
                     context.vulnerability_data = _parse_llm_vulnerability_json(response_text)
@@ -809,6 +875,13 @@ class CyberAttackAgentWrapper:
                     
                     # Extract the actual response from Ollama format
                     response_text = llm_response['response']
+                    metric = llm_response.get("metrics", {})
+                    if metric:
+                        metric["rag_context_tokens"] = metric.get("rag_context_tokens", 0) + context.metrics.get("rag", {}).get("rag_context_tokens", 0)
+                        metric["total_context_tokens"] = metric.get("prompt_tokens", 0)
+                        context.record_metric("main_analysis", metric)
+                        context.log_step(format_metric_log("📊 Main analysis metrics", metric))
+                        context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
                     
                     try:
                         # Try to parse as JSON
@@ -883,6 +956,19 @@ class CyberAttackAgentWrapper:
                     model_name="all-MiniLM-L6-v2",
                 )
                 rag_text = (rag_result or {}).get("final_answer", "")
+                rag_metrics = (rag_result or {}).get("metrics", {})
+                if rag_metrics:
+                    context.record_metric("rag", {
+                        "stage": "rag",
+                        "model": rag_metrics.get("model", ""),
+                        "prompt_tokens": rag_metrics.get("query_tokens", 0),
+                        "response_tokens": rag_metrics.get("answer_tokens", 0),
+                        "rag_context_tokens": rag_metrics.get("retrieved_context_tokens", 0),
+                        "total_context_tokens": rag_metrics.get("query_tokens", 0) + rag_metrics.get("retrieved_context_tokens", 0),
+                        "tokens_per_second": rag_metrics.get("tokens_per_second", 0),
+                    })
+                    context.log_step(format_metric_log("📚 RAG metrics", context.metrics.get("rag")))
+                    context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
                 context.log_step("RAG node completed successfully")
             else:
                 context.log_step(
@@ -922,6 +1008,59 @@ class CyberAttackAgentWrapper:
             .get("docker", {})
             .get("image", "gcc:latest")
         )
+
+    def _lookup_userspace_tool(self, context: AgentContext) -> Optional[Dict[str, str]]:
+        product_hint = str(context.cve_target_info.get("product_hint") or "").lower()
+        vendor_hint = str(context.cve_target_info.get("vendor_hint") or "").lower()
+        description = str(context.cve_target_info.get("description") or "").lower()
+        references = " ".join(context.cve_target_info.get("references") or []).lower()
+
+        candidates = [product_hint, vendor_hint]
+        if product_hint in {"php", "php_zip"} or "php" in description or "php" in references:
+            candidates.extend(["php_zip", "php"])
+        if "wildmidi" in description or "wildmidi" in references:
+            candidates.append("wildmidi")
+        if "ffmpeg" in description or "ffmpeg" in references:
+            candidates.append("ffmpeg")
+        if "imagemagick" in description or "imagemagick" in references:
+            candidates.append("imagemagick")
+        if "irssi" in description or "irssi" in references:
+            candidates.append("irssi")
+        if "unzip" in description or "unzip" in references:
+            candidates.append("unzip")
+
+        for candidate in candidates:
+            if candidate in USPACE_TOOL_CATALOG:
+                return USPACE_TOOL_CATALOG[candidate].copy()
+        return None
+
+    def _generic_userspace_reproduction_plan(self, context: AgentContext) -> Optional[Dict[str, Any]]:
+        target_family = context.cve_target_info.get("target_family", "unresolved")
+        tool_info = self._lookup_userspace_tool(context)
+        if not tool_info:
+            return None
+
+        package_name = tool_info["package_name"]
+        docker_base_image = tool_info["docker_base_image"]
+        setup_commands = ["apt-get update -qq"]
+
+        if target_family == "language_runtime":
+            setup_commands.append("php -v >/tmp/runtime_check.log 2>&1 || (cat /tmp/runtime_check.log && exit 1)")
+        else:
+            setup_commands.append(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                f"{package_name} python3 >/tmp/pkg_setup.log 2>&1 || (cat /tmp/pkg_setup.log && exit 1)"
+            )
+
+        return {
+            "strategy": "system_package_tool",
+            "tool_name": tool_info["tool_name"],
+            "executable_path": tool_info["executable_path"],
+            "target_family": target_family,
+            "image_strategy": context.cve_target_info.get("image_strategy", "package_image"),
+            "docker_base_image": docker_base_image,
+            "setup_commands": setup_commands,
+        }
 
     def _extract_cve_references(self, cve_data: Dict[str, Any]) -> List[str]:
         root = cve_data.get("cve", cve_data)
@@ -1000,9 +1139,16 @@ class CyberAttackAgentWrapper:
             ]
 
             primary_target = next((target for target in cpe_targets if target.get("target_type") == "a"), None)
+            if primary_target is None and cpe_targets:
+                primary_target = cpe_targets[0]
             version_hint = primary_target.get("version") if primary_target else None
             if version_hint in {"*", "-", ""}:
                 version_hint = None
+            family_info = classify_cve_target_family(
+                description=description,
+                primary_target=primary_target,
+                references=references,
+            )
 
             context.cve_target_info = {
                 "cve_id": context.cve_id,
@@ -1017,6 +1163,9 @@ class CyberAttackAgentWrapper:
                 "product_hint": primary_target.get("product") if primary_target else None,
                 "vendor_hint": primary_target.get("vendor") if primary_target else None,
                 "version_hint": version_hint,
+                "target_family": family_info["target_family"],
+                "image_strategy": family_info["image_strategy"],
+                "docker_base_image": family_info["docker_base_image"],
                 "rag_context": context.rag_context,
                 "missing_fields": [],
             }
@@ -1042,11 +1191,31 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.PLANNING_REPRODUCTION
 
         try:
+            target_family = context.cve_target_info.get("target_family", "unresolved")
+            image_strategy = context.cve_target_info.get("image_strategy", "unresolved")
+            selected_base_image = context.cve_target_info.get("docker_base_image", self._docker_base_image())
+
+            if target_family == "kernel_level":
+                context.reproduction_plan = {
+                    "strategy": "unresolved_cve",
+                    "reason": "requires_kernel_environment",
+                    "missing_fields": ["bootable_vulnerable_kernel"],
+                    "target_family": target_family,
+                    "image_strategy": image_strategy,
+                    "docker_base_image": selected_base_image,
+                }
+                context.current_state = WorkflowState.REPRODUCTION_UNRESOLVED
+                context.log_step("CVE reproduction unresolved: kernel-level target requires VM or booted vulnerable kernel")
+                return context
+
             if context.cve_id == "CVE-2008-0888":
                 context.reproduction_plan = {
                     "strategy": "system_package_tool",
                     "tool_name": "unzip",
                     "executable_path": "/usr/bin/unzip",
+                    "target_family": "system_package_tool",
+                    "image_strategy": "package_image",
+                    "docker_base_image": "debian:bookworm-slim",
                     "setup_commands": [
                         "apt-get update",
                         "apt-get install -y unzip python3 gcc wget curl",
@@ -1064,6 +1233,9 @@ class CyberAttackAgentWrapper:
                     "strategy": "system_package_tool",
                     "tool_name": "cimg_bmp_loader",
                     "executable_path": "/tmp/cimg_bmp_loader",
+                    "target_family": "media_stack",
+                    "image_strategy": "package_image",
+                    "docker_base_image": "debian:bookworm-slim",
                     "setup_commands": [
                         "apt-get update -qq",
                         "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++ git ca-certificates >/tmp/cimg_setup.log 2>&1 || (cat /tmp/cimg_setup.log && exit 1)",
@@ -1109,20 +1281,37 @@ EOF""",
                     "strategy": "unresolved_cve",
                     "reason": "insufficient_target_evidence",
                     "missing_fields": missing,
+                    "target_family": target_family,
+                    "image_strategy": image_strategy,
+                    "docker_base_image": selected_base_image,
                 }
                 context.current_state = WorkflowState.REPRODUCTION_UNRESOLVED
                 context.log_step(f"CVE reproduction unresolved: missing {', '.join(missing)}")
                 return context
 
-            # v1 is conservative: evidence is recorded, but automatic source builds
-            # are not attempted until package-specific builders exist.
+            generic_plan = self._generic_userspace_reproduction_plan(context)
+            if generic_plan:
+                context.reproduction_plan = generic_plan
+                context.current_state = WorkflowState.REPRODUCTION_PLANNED
+                context.log_step(
+                    "CVE reproduction planned with generic builder: "
+                    f"target_family={generic_plan['target_family']} image={generic_plan['docker_base_image']}"
+                )
+                return context
+
             context.reproduction_plan = {
                 "strategy": "unresolved_cve",
                 "reason": "no_automatic_builder_available",
                 "missing_fields": ["package_specific_builder"],
+                "target_family": target_family,
+                "image_strategy": image_strategy,
+                "docker_base_image": selected_base_image,
             }
             context.current_state = WorkflowState.REPRODUCTION_UNRESOLVED
-            context.log_step("CVE reproduction unresolved: no automatic builder available")
+            context.log_step(
+                "CVE reproduction unresolved: no automatic builder available "
+                f"for target_family={target_family}"
+            )
         except Exception as e:
             context.set_error(f"Reproduction planning failed: {e}", WorkflowState.TARGET_FAILED)
 
@@ -1141,7 +1330,9 @@ EOF""",
                     cwe_id=context.cwe_id,
                     tool_name=context.reproduction_plan.get("tool_name", "tool"),
                     executable_path=context.reproduction_plan.get("executable_path", "/usr/bin/env"),
-                    docker_base_image=self._docker_base_image(),
+                    target_family=context.reproduction_plan.get("target_family", "system_package_tool"),
+                    image_strategy=context.reproduction_plan.get("image_strategy", "package_image"),
+                    docker_base_image=context.reproduction_plan.get("docker_base_image", self._docker_base_image()),
                     setup_commands=context.reproduction_plan.get("setup_commands", []),
                     metadata={
                         "target_info": context.cve_target_info,
@@ -1159,10 +1350,12 @@ EOF""",
                 context.target_spec = build_unresolved_cve_target_spec(
                     cve_id=context.cve_id,
                     cwe_id=context.cwe_id,
-                    docker_base_image=self._docker_base_image(),
+                    docker_base_image=context.reproduction_plan.get("docker_base_image", self._docker_base_image()),
                     metadata={
                         "target_info": context.cve_target_info,
                         "reproduction_plan": context.reproduction_plan,
+                        "target_family": context.reproduction_plan.get("target_family"),
+                        "image_strategy": context.reproduction_plan.get("image_strategy"),
                     },
                 ).to_dict()
                 context.sandbox_result = json.dumps(
@@ -1247,11 +1440,22 @@ EOF""",
                     context.log_step(f"   CWE: {context.cwe_id}")
                     context.log_step(f"   Expert: {context.prompt_metadata.get('expert_profile', 'N/A')}")
 
-                    context.attack_script = generateExploitWithDynamicPrompt(
+                    generation_result = generateExploitWithDynamicPrompt(
                         vulnerability_data=vulnerability,
                         system_prompt=context.system_prompt,
                         user_prompt=context.user_prompt
                     )
+                    if isinstance(generation_result, dict):
+                        context.attack_script = generation_result.get("code", "")
+                        metric = generation_result.get("metrics", {})
+                        if metric:
+                            metric["rag_context_tokens"] = context.metrics.get("rag", {}).get("rag_context_tokens", 0)
+                            metric["total_context_tokens"] = metric.get("prompt_tokens", 0)
+                            context.record_metric("script_generation", metric)
+                            context.log_step(format_metric_log("📊 Script generation metrics", metric))
+                            context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
+                    else:
+                        context.attack_script = generation_result
             
             # --- FILE MODE: use resultsFromLLM with its existing prompt ---
             else:
@@ -1264,7 +1468,16 @@ EOF""",
                 
                 # Use the parsed JSON structure instead of the raw LLM prose/markdown
                 # so Agent.py receives the exact schema it expects.
-                context.attack_script = resultsFromLLM(json.dumps(context.vulnerability_data))
+                generation_result = resultsFromLLM(json.dumps(context.vulnerability_data))
+                if isinstance(generation_result, dict):
+                    context.attack_script = generation_result.get("code", "")
+                    metric = generation_result.get("metrics", {})
+                    if metric:
+                        context.record_metric("script_generation", metric)
+                        context.log_step(format_metric_log("📊 Script generation metrics", metric))
+                        context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
+                else:
+                    context.attack_script = generation_result
             
             if context.attack_script:
                 # Check if LLM refused instead of generating code
@@ -1338,8 +1551,14 @@ EOF""",
             }
 
             target_type = (context.target_spec or {}).get("target_type")
+            docker_env = sandbox_manager.environments.get("Docker_Container")
+            if docker_env and context.target_spec:
+                selected_image = context.target_spec.get("docker_base_image")
+                if selected_image:
+                    docker_env.image = selected_image
+                    context.log_step(f"Using Docker image: {selected_image}")
+
             if target_type == "cve_system_binary":
-                docker_env = sandbox_manager.environments.get("Docker_Container")
                 setup_commands = (context.target_spec.get("metadata") or {}).get("setup_commands", [])
                 if docker_env and setup_commands:
                     docker_env.setup_commands = setup_commands
@@ -1730,7 +1949,8 @@ Do NOT refuse. Do NOT apologize. Generate ONLY executable Python 3 code.
             "attack_result": final_context.attack_result,
             "error_message": final_context.error_message,
             "final_state": final_context.current_state.value,
-            "execution_log": final_context.execution_log
+            "execution_log": final_context.execution_log,
+            "metrics": final_context.metrics,
         }
 
 

@@ -81,6 +81,9 @@ class CyberState(TypedDict, total=False):
     attack_feedback: Dict[str, Any]
     attack_history: List[Dict[str, Any]]
 
+    # Runtime metrics
+    metrics: Dict[str, Any]
+
     # Logs
     execution_log: List[str]
     logs: List[str]     # alias for compatibility
@@ -136,6 +139,7 @@ def _context_from_state(state: CyberState) -> AgentContext:
     ctx.max_retries = state.get("max_retries", 3)
     ctx.attack_feedback = state.get("attack_feedback", {})
     ctx.attack_history = list(state.get("attack_history", []))
+    ctx.metrics = state.get("metrics", {})
 
     # Logs: prefer execution_log, then logs
     logs = state.get("execution_log") or state.get("logs") or []
@@ -191,6 +195,7 @@ def _state_from_context(ctx: AgentContext) -> CyberState:
         "max_retries": getattr(ctx, "max_retries", 3),
         "attack_feedback": getattr(ctx, "attack_feedback", {}),
         "attack_history": list(getattr(ctx, "attack_history", [])),
+        "metrics": getattr(ctx, "metrics", {}),
         "execution_log": logs,
         "logs": logs,
     }
