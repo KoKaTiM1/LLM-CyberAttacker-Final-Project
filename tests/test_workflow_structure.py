@@ -28,7 +28,11 @@ def print_workflow_structure():
     print("  ↓")
     print("  Step 4: validate_file")
     print("  ↓")
+    print("  Step 4b: rag")
+    print("  ↓")
     print("  Step 5: analyze_vulnerability (LLM identifies vuln type)")
+    print("  ↓")
+    print("  Step 5b: prepare_target_environment")
     print("  ↓")
     print("  Step 6: create_attack_script")
     print("  ↓")
@@ -42,13 +46,17 @@ def print_workflow_structure():
     print("  ↓")
     print("  Step 3: build_prompt")
     print("  ↓")
-    print("  Step 4: validate_file (skipped if no file)")
+    print("  Step 4: rag")
     print("  ↓")
-    print("  Step 5: analyze_vulnerability (uses CVE prompts)")
+    print("  Step 5: resolve_cve_target")
     print("  ↓")
-    print("  Step 6: create_attack_script")
+    print("  Step 6: plan_reproduction")
     print("  ↓")
-    print("  Step 7: execute_in_sandbox")
+    print("  Step 7: build_target_artifact")
+    print("  ↓")
+    print("  Step 8: create_attack_script only if target is reproducible")
+    print("  ↓")
+    print("  Step 9: execute_in_sandbox")
     print()
     
     print("=" * 80)
@@ -119,24 +127,24 @@ def print_workflow_structure():
             print(f"   ❌ WRONG: Expected build_prompt, got {next_node}")
         print()
         
-        print("5. CVE FLOW (build_prompt → create_attack_script):")
+        print("5. CVE FLOW (build_prompt → rag):")
         prompt_built = {"error_message": ""}
         next_node = route_after_build_prompt(prompt_built)
         print(f"   {next_node}")
-        if next_node == "create_attack_script":
+        if next_node == "rag":
             print("   ✅ CORRECT")
         else:
-            print(f"   ❌ WRONG: Expected create_attack_script, got {next_node}")
+            print(f"   ❌ WRONG: Expected rag, got {next_node}")
         print()
         
-        print("6. FILE FLOW (validate_file → analyze_vulnerability):")
+        print("6. FILE FLOW (validate_file → rag):")
         file_valid = {"error_message": ""}
         next_node = route_after_validate_file(file_valid)
         print(f"   {next_node}")
-        if next_node == "analyze_vulnerability":
+        if next_node == "rag":
             print("   ✅ CORRECT")
         else:
-            print(f"   ❌ WRONG: Expected analyze_vulnerability, got {next_node}")
+            print(f"   ❌ WRONG: Expected rag, got {next_node}")
         print()
         
     except Exception as e:
@@ -150,8 +158,8 @@ def print_workflow_structure():
     print("=" * 80)
     print()
     print("The workflow structure matches our design:")
-    print("  ✅ FILE mode: check_connections → validate_file → analyze_vulnerability → create_attack_script → execute_in_sandbox")
-    print("  ✅ CVE mode:  check_connections → load_cve → build_prompt → create_attack_script → execute_in_sandbox")
+    print("  ✅ FILE mode: check_connections → validate_file → rag → analyze_vulnerability → prepare_target_environment → create_attack_script → execute_in_sandbox")
+    print("  ✅ CVE mode:  check_connections → load_cve → build_prompt → rag → resolve_cve_target → plan_reproduction → build_target_artifact")
     print("  ✅ Validation works correctly")
     print()
     

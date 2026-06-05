@@ -80,7 +80,8 @@ class LocalEmbedder:
             ) from e
 
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        self.device = os.getenv("RAG_EMBEDDING_DEVICE", "cpu")
+        self.model = SentenceTransformer(model_name, device=self.device)
 
         # Probe dimension once to avoid hardcoding.
         probe = self.model.encode(["dimension_probe"], normalize_embeddings=True, convert_to_numpy=True)

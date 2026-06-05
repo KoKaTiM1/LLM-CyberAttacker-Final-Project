@@ -125,10 +125,64 @@ def test_graph_state_conversion():
     return True
 
 
+def test_file_target_spec_creation():
+    """Test file mode target preparation creates a Docker local-file spec"""
+    print("\n" + "=" * 80)
+    print("TEST 5: FILE TARGET SPEC")
+    print("=" * 80)
+
+    from modules.agent_langgraph_wrapper import CyberAttackAgentWrapper, AgentContext
+
+    file_path = project_root / "demos" / "vulnerable_example.c"
+    ctx = AgentContext(file_path=str(file_path))
+    ctx = CyberAttackAgentWrapper().prepare_target_environment_step(ctx)
+
+    print(f"✅ Target state: {ctx.current_state.value}")
+    print(f"   Target type: {ctx.target_spec.get('target_type')}")
+
+    assert ctx.current_state.value == "target_ready"
+    assert ctx.target_spec["mode"] == "file"
+    assert ctx.target_spec["target_type"] == "local_file"
+    assert ctx.target_spec["container_target_path"] == "/tmp/target.c"
+    assert "gcc" in ctx.target_spec["compile_command"]
+
+    print("✅ File target spec created correctly")
+    print()
+    return True
+
+
+def test_unresolved_cve_target_spec():
+    """Test unresolved CVE reproduction produces a non-executable TargetSpec"""
+    print("\n" + "=" * 80)
+    print("TEST 6: UNRESOLVED CVE TARGET SPEC")
+    print("=" * 80)
+
+    from modules.agent_langgraph_wrapper import CyberAttackAgentWrapper, AgentContext
+
+    wrapper = CyberAttackAgentWrapper()
+    ctx = AgentContext(cve_id="CVE-2008-0888")
+    ctx.cwe_id = "CWE-119"
+    ctx.cve_target_info = {"missing_fields": ["source_or_build_reference"]}
+    ctx = wrapper.plan_reproduction_step(ctx)
+    ctx = wrapper.build_target_artifact_step(ctx)
+
+    print(f"✅ Target state: {ctx.current_state.value}")
+    print(f"   Target type: {ctx.target_spec.get('target_type')}")
+
+    assert ctx.current_state.value == "target_unresolved"
+    assert ctx.target_spec["mode"] == "cve"
+    assert ctx.target_spec["target_type"] == "unresolved_cve"
+    assert ctx.target_spec["build_strategy"] == "needs_reproduction_plan"
+
+    print("✅ Unresolved CVE target spec created correctly")
+    print()
+    return True
+
+
 def test_run_cyber_attack_signature():
     """Test that run_cyber_attack accepts the correct parameters"""
     print("\n" + "=" * 80)
-    print("TEST 5: RUN_CYBER_ATTACK SIGNATURE")
+    print("TEST 7: RUN_CYBER_ATTACK SIGNATURE")
     print("=" * 80)
     
     from modules.cyber_attack_graph import run_cyber_attack
@@ -163,6 +217,8 @@ def main():
         ("CVE Mode Routing", test_cve_mode_routing),
         ("Invalid Input Rejection", test_invalid_input_rejection),
         ("State Conversion", test_graph_state_conversion),
+        ("File Target Spec", test_file_target_spec_creation),
+        ("Unresolved CVE Target Spec", test_unresolved_cve_target_spec),
         ("Function Signature", test_run_cyber_attack_signature),
     ]
     
@@ -200,6 +256,7 @@ def main():
         print("  ✅ CVE mode routing works")
         print("  ✅ Invalid input is rejected")
         print("  ✅ State conversion is bidirectional")
+        print("  ✅ Target specs are produced")
         print("  ✅ Function signatures are correct")
         print()
         return True
