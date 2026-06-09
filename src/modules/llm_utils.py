@@ -67,6 +67,70 @@ def build_ollama_metrics(
     }
 
 
+def build_llamacpp_metrics(
+    *,
+    stage: str,
+    model: str,
+    prompt_text: str = "",
+    response_text: str = "",
+    response_payload: Optional[Dict[str, Any]] = None,
+    retrieved_context_text: str = "",
+) -> Dict[str, Any]:
+    """Normalize raw llama.cpp or OpenAI-compatible server metrics."""
+    payload = response_payload or {}
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    timings = payload.get("timings") if isinstance(payload.get("timings"), dict) else {}
+
+    prompt_eval_count = _safe_int(
+        payload.get("tokens_evaluated")
+        or payload.get("prompt_n")
+        or usage.get("prompt_tokens")
+    )
+    eval_count = _safe_int(
+        payload.get("tokens_predicted")
+        or payload.get("predicted_n")
+        or usage.get("completion_tokens")
+    )
+
+    predicted_per_second = 0.0
+    try:
+        predicted_per_second = float(
+            payload.get("predicted_per_second")
+            or timings.get("predicted_per_second")
+            or 0
+        )
+    except (TypeError, ValueError):
+        predicted_per_second = 0.0
+
+    predicted_ms = 0.0
+    try:
+        predicted_ms = float(payload.get("predicted_ms") or timings.get("predicted_ms") or 0)
+    except (TypeError, ValueError):
+        predicted_ms = 0.0
+
+    prompt_tokens = prompt_eval_count or approximate_token_count(prompt_text)
+    response_tokens = eval_count or approximate_token_count(response_text)
+    rag_context_tokens = approximate_token_count(retrieved_context_text)
+    total_context_tokens = prompt_tokens + rag_context_tokens
+    tokens_per_second = predicted_per_second
+    if tokens_per_second <= 0 and predicted_ms > 0:
+        tokens_per_second = response_tokens / (predicted_ms / 1000)
+
+    return {
+        "stage": stage,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "response_tokens": response_tokens,
+        "rag_context_tokens": rag_context_tokens,
+        "total_context_tokens": total_context_tokens,
+        "tokens_per_second": round(tokens_per_second, 2),
+        "prompt_eval_count": prompt_eval_count,
+        "eval_count": eval_count,
+        "eval_duration_seconds": round(predicted_ms / 1000, 2) if predicted_ms > 0 else 0,
+        "total_duration_seconds": 0,
+    }
+
+
 def build_langchain_metrics(
     *,
     stage: str,

@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from modules.llm_utils import (
     approximate_token_count,
     build_langchain_metrics,
+    build_llamacpp_metrics,
     build_ollama_metrics,
     merge_metric_totals,
 )
@@ -73,3 +74,26 @@ def test_merge_metric_totals_accumulates_counts():
         "rag_context_tokens": 4,
         "total_context_tokens": 21,
     }
+
+
+def test_build_llamacpp_metrics_reads_raw_server_counts():
+    payload = {
+        "tokens_evaluated": 100,
+        "tokens_predicted": 50,
+        "timings": {
+            "predicted_per_second": 25.5,
+            "predicted_ms": 1960,
+        },
+    }
+
+    metrics = build_llamacpp_metrics(
+        stage="remote_generation",
+        model="cluster-model",
+        prompt_text="prompt",
+        response_text="response",
+        response_payload=payload,
+    )
+
+    assert metrics["prompt_tokens"] == 100
+    assert metrics["response_tokens"] == 50
+    assert metrics["tokens_per_second"] == 25.5

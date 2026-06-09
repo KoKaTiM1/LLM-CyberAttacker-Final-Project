@@ -20,7 +20,6 @@ Dependencies:
 """
 
 from __future__ import annotations
-from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
 
 import os
 import re
@@ -36,26 +35,72 @@ from langchain_core.messages import (
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-# LLM Setup for Ollama (local, no API key needed)
-from langchain_ollama import ChatOllama
 from ..llm_utils import approximate_token_count, build_langchain_metrics, merge_metric_totals
+from ..inference_provider import get_rag_model
+from ..services.inference_service import InferenceService
 
-DEFAULT_OLLAMA_MODEL = os.getenv("RAG_LLM_MODEL", "llama3.2:1b")
+DEFAULT_RAG_MODEL = get_rag_model()
+
+
+def _messages_to_prompt(messages: list[dict[str, str]] | list[Any]) -> str:
+    parts: list[str] = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+        else:
+            role = getattr(msg, "type", "user")
+            content = getattr(msg, "content", str(msg))
+        parts.append(f"{role}: {content}")
+    return "\n\n".join(parts)
+
+
+class ProviderStructuredInvoker:
+    def __init__(self, adapter: "ProviderLLMAdapter", schema: Any):
+        self.adapter = adapter
+        self.schema = schema
+
+    def invoke(self, messages: list[dict[str, str]] | list[Any]) -> Any:
+        prompt = (
+            f"{_messages_to_prompt(messages)}\n\n"
+            "Return JSON only with keys: binary_score, reasoning. "
+            "binary_score must be either yes or no."
+        )
+        message = self.adapter.invoke([{"role": "user", "content": prompt}])
+        raw_text = getattr(message, "content", str(message))
+        score = _normalize_binary_score(raw_text)
+        return self.schema(binary_score=score, reasoning=raw_text[:300])
+
+
+class ProviderLLMAdapter:
+    def __init__(self, model_name: Optional[str] = None):
+        self.model_name = model_name or DEFAULT_RAG_MODEL
+
+    def invoke(self, messages: list[dict[str, str]] | list[Any]) -> AIMessage:
+        prompt = _messages_to_prompt(messages)
+        result = InferenceService().generate_rag(
+            prompt=prompt,
+            model=self.model_name,
+            stage="rag_llm_step",
+        )
+        metrics = result.metrics or {}
+        response_metadata = {
+            "prompt_eval_count": metrics.get("prompt_eval_count") or metrics.get("prompt_tokens", 0),
+            "eval_count": metrics.get("eval_count") or metrics.get("response_tokens", 0),
+            "eval_duration": int(float(metrics.get("eval_duration_seconds", 0)) * 1_000_000_000),
+            "total_duration": int(float(metrics.get("total_duration_seconds", 0)) * 1_000_000_000),
+        }
+        return AIMessage(content=result.text, response_metadata=response_metadata)
+
+    def with_structured_output(self, schema: Any) -> ProviderStructuredInvoker:
+        return ProviderStructuredInvoker(self, schema)
 
 
 def get_llm(model_name: Optional[str] = None):
     """
-    Initialize Ollama LLM running locally.
-    
-    Assumes Ollama is running at: http://localhost:11434
-    Note: Make sure Ollama is running before using this!
+    Initialize the configured project inference provider for RAG LLM steps.
     """
-    return ChatOllama(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_URL,
-        temperature=0,
-        timeout=OLLAMA_TIMEOUT_SECONDS,
-    )
+    return ProviderLLMAdapter(model_name or DEFAULT_RAG_MODEL)
 
 
 # ---------------------------
@@ -477,7 +522,7 @@ def call_agentic_rag(
             final_answer = msg.content
             metric = build_langchain_metrics(
                 stage="rag_llm_step",
-                model=llm_model_name or DEFAULT_OLLAMA_MODEL,
+                model=llm_model_name or DEFAULT_RAG_MODEL,
                 response_text=msg.content,
                 message=msg,
             )
@@ -493,7 +538,7 @@ def call_agentic_rag(
         "retrieved_context_tokens": rag_context_tokens,
         "answer_tokens": final_answer_metrics.get("response_tokens", 0),
         "tokens_per_second": final_answer_metrics.get("tokens_per_second", 0),
-        "model": llm_model_name or DEFAULT_OLLAMA_MODEL,
+        "model": llm_model_name or DEFAULT_RAG_MODEL,
         "prompt_tokens": final_answer_metrics.get("prompt_tokens", 0),
         "response_tokens": metrics_total.get("response_tokens", 0),
         "total_context_tokens": final_answer_metrics.get("total_context_tokens", 0),
