@@ -1,10 +1,9 @@
 import json
-import requests
 import re
 import logging
-from .model_config import OLLAMA_MODEL, OLLAMA_URL, OLLAMA_TIMEOUT_SECONDS
+from .inference_provider import get_main_model
 from .prompt_builder import build_exploit_prompt
-from .llm_utils import strip_thinking_tags, build_ollama_metrics
+from .services.inference_service import InferenceService
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +59,12 @@ def generateExploitWithDynamicPrompt(vulnerability_data: dict, system_prompt: st
     task_prompt += f"Explanation: {vulnerability_data.get('Explanation', 'Unknown')}\n"
     task_prompt += "\nGenerate the exploit code now:"
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "system": system_prompt,
-        "prompt": task_prompt,
-        "stream": False
-    }
+    selected_model = get_main_model()
 
     logger.info("="*60)
     logger.info("[generateExploitWithDynamicPrompt] SENDING REQUEST TO LLM")
     logger.info("="*60)
-    logger.info(f"URL: {OLLAMA_URL}")
-    logger.info(f"Model: {OLLAMA_MODEL}")
+    logger.info(f"Model: {selected_model}")
     logger.info(f"System prompt length: {len(system_prompt)} chars")
     logger.info(f"Task prompt length: {len(task_prompt)} chars")
     logger.info(f"--- SYSTEM PROMPT START ---")
@@ -82,35 +75,23 @@ def generateExploitWithDynamicPrompt(vulnerability_data: dict, system_prompt: st
     logger.info(f"--- TASK PROMPT END ---")
     
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
-        logger.info(f"Response Status: {response.status_code}")
-
-        if response.status_code == 200:
-            response_data = response.json()
-            if isinstance(response_data, dict) and 'response' in response_data:
-                llm_response = strip_thinking_tags(response_data['response'])
-                logger.info(f"--- LLM RAW RESPONSE START ---")
-                logger.info(llm_response)
-                logger.info(f"--- LLM RAW RESPONSE END ---")
-                extracted = extract_code_from_markdown(llm_response)
-                metrics = build_ollama_metrics(
-                    stage="cve_exploit_generation",
-                    model=OLLAMA_MODEL,
-                    prompt_text=f"{system_prompt}\n\n{task_prompt}",
-                    response_text=extracted,
-                    response_payload=response_data,
-                )
-                logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
-                logger.info(extracted)
-                logger.info(f"--- EXTRACTED CODE END ---")
-                return {
-                    "code": extracted,
-                    "metrics": metrics,
-                }
-            return response_data
-        else:
-            logger.error(f"Error: {response.status_code}, {response.text}")
-            return None
+        result = InferenceService().generate_main(
+            prompt=task_prompt,
+            system=system_prompt,
+            model=selected_model,
+            stage="cve_exploit_generation",
+        )
+        logger.info("--- LLM RAW RESPONSE START ---")
+        logger.info(result.text)
+        logger.info("--- LLM RAW RESPONSE END ---")
+        extracted = extract_code_from_markdown(result.text)
+        logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
+        logger.info(extracted)
+        logger.info("--- EXTRACTED CODE END ---")
+        return {
+            "code": extracted,
+            "metrics": result.metrics,
+        }
     except Exception as e:
         logger.error(f"Request failed: {e}")
         return None
@@ -133,11 +114,7 @@ def resultsFromLLM(LLMresult):
             return None
             
         prompt = build_exploit_prompt(vulnerability)
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False
-        }
+        selected_model = get_main_model()
 
         logger.info("="*60)
         logger.info("[resultsFromLLM] SENDING REQUEST TO LLM")
@@ -147,34 +124,22 @@ def resultsFromLLM(LLMresult):
         logger.info(prompt)
         logger.info(f"--- PROMPT END ---")
 
-        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
-        logger.info(f"Response Status: {response.status_code}")
-        if response.status_code == 200:
-            response_data = response.json()
-            if isinstance(response_data, dict) and 'response' in response_data:
-                llm_response = strip_thinking_tags(response_data['response'])
-                logger.info(f"--- LLM RAW RESPONSE START ---")
-                logger.info(llm_response)
-                logger.info(f"--- LLM RAW RESPONSE END ---")
-                extracted = extract_code_from_markdown(llm_response)
-                metrics = build_ollama_metrics(
-                    stage="file_exploit_generation",
-                    model=OLLAMA_MODEL,
-                    prompt_text=prompt,
-                    response_text=extracted,
-                    response_payload=response_data,
-                )
-                logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
-                logger.info(extracted)
-                logger.info(f"--- EXTRACTED CODE END ---")
-                return {
-                    "code": extracted,
-                    "metrics": metrics,
-                }
-            return response_data
-        else:
-            logger.error(f"Error: {response.status_code}, {response.text}")
-            return None
+        result = InferenceService().generate_main(
+            prompt=prompt,
+            model=selected_model,
+            stage="file_exploit_generation",
+        )
+        logger.info("--- LLM RAW RESPONSE START ---")
+        logger.info(result.text)
+        logger.info("--- LLM RAW RESPONSE END ---")
+        extracted = extract_code_from_markdown(result.text)
+        logger.info(f"--- EXTRACTED CODE START ({len(extracted)} chars) ---")
+        logger.info(extracted)
+        logger.info("--- EXTRACTED CODE END ---")
+        return {
+            "code": extracted,
+            "metrics": result.metrics,
+        }
     except Exception as e:
         print(f"Request failed: {e}")
         return None

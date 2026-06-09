@@ -27,8 +27,8 @@ from .LLM import getFile, sendToLLM, sendToLLMWithDynamicPrompt, checkConnection
 from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
-from .sandbox import SandboxManager
 from .llm_utils import format_metric_log, merge_metric_totals
+from .services import ExecutionService, RagService
 from .target_spec import (
     build_cve_tool_target_spec,
     build_file_target_spec,
@@ -919,72 +919,28 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.RAG_PROCESSING
 
         try:
-            # Prefer explicit query from env, then derive a mode-specific query.
-            query = os.getenv("RAG_USER_QUERY", "").strip()
-            if not query:
-                if context.input_type == "cve" and context.cve_data:
-                    orchestrator = PromptOrchestrator()
-                    description = orchestrator._extract_description(context.cve_data) or ""
-                    query = " ".join(
-                        part
-                        for part in [
-                            context.cve_id or "",
-                            context.cwe_id or "",
-                            context.prompt_metadata.get("category", ""),
-                            description,
-                        ]
-                        if part
-                    )
-                else:
-                    query = context.file_content
+            result = RagService().enrich(
+                input_type=context.input_type,
+                file_content=context.file_content,
+                cve_data=context.cve_data,
+                cve_id=context.cve_id or "",
+                cwe_id=context.cwe_id or "",
+                prompt_metadata=context.prompt_metadata,
+                user_prompt=context.user_prompt,
+            )
 
-            context.user_query = query
+            context.user_query = result.user_query
+            context.rag_context = result.rag_context
+            context.file_content = result.file_content
+            context.user_prompt = result.user_prompt
 
-            # Resolve data paths used by the RAG module.
-            project_root = Path(__file__).resolve().parents[2]
-            sqlite_path = project_root / "data" / "cve.db"
-            faiss_path = project_root / "data" / "cve.index"
+            if result.metric:
+                context.record_metric("rag", result.metric)
+                context.log_step(format_metric_log("📚 RAG metrics", context.metrics.get("rag")))
+                context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
 
-            rag_text = ""
-            if faiss_path.exists() and sqlite_path.exists():
-                from .rag.agent_rag import call_agentic_rag
-
-                rag_result = call_agentic_rag(
-                    user_query=query,
-                    sqlite_path=str(sqlite_path),
-                    faiss_path=str(faiss_path),
-                    model_name="all-MiniLM-L6-v2",
-                )
-                rag_text = (rag_result or {}).get("final_answer", "")
-                rag_metrics = (rag_result or {}).get("metrics", {})
-                if rag_metrics:
-                    context.record_metric("rag", {
-                        "stage": "rag",
-                        "model": rag_metrics.get("model", ""),
-                        "prompt_tokens": rag_metrics.get("query_tokens", 0),
-                        "response_tokens": rag_metrics.get("answer_tokens", 0),
-                        "rag_context_tokens": rag_metrics.get("retrieved_context_tokens", 0),
-                        "total_context_tokens": rag_metrics.get("query_tokens", 0) + rag_metrics.get("retrieved_context_tokens", 0),
-                        "tokens_per_second": rag_metrics.get("tokens_per_second", 0),
-                    })
-                    context.log_step(format_metric_log("📚 RAG metrics", context.metrics.get("rag")))
-                    context.log_step(format_metric_log("📈 Total metrics so far", context.metrics.get("totals")))
-                context.log_step("RAG node completed successfully")
-            else:
-                context.log_step(
-                    f"RAG data files missing ({sqlite_path.name} or {faiss_path.name}); continuing with original input"
-                )
-
-            if rag_text:
-                context.rag_context = rag_text
-                if context.input_type == "cve":
-                    context.user_prompt = f"{context.user_prompt}\n\n[RAG Context]\n{rag_text}\n"
-                else:
-                    # Keep original C content and append RAG guidance for the LLM reviewer.
-                    context.file_content = (
-                        f"{context.file_content}\n\n"
-                        f"[RAG Context]\n{rag_text}\n"
-                    )
+            for message in result.log_messages:
+                context.log_step(message)
 
             context.current_state = WorkflowState.RAG_SUCCESS
 
@@ -1502,177 +1458,33 @@ EOF""",
         """Step 7: Execute attack script in sandbox environments"""
         context.log_step("Step 7: Executing attack script in sandbox...")
         context.current_state = WorkflowState.EXECUTING_IN_SANDBOX
-
-        def mark_infra_failure(message: str, details: Dict[str, Any] | None = None) -> AgentContext:
-            payload = {
-                "status": "infrastructure_error",
-                "message": message,
-                "details": details or {},
-            }
-            context.sandbox_result = json.dumps({"infrastructure": payload}, indent=2)
-            context.set_error(message, WorkflowState.SANDBOX_FAILED)
-            return context
         
         try:
-            if context.target_spec and context.target_spec.get("target_type") == "unresolved_cve":
-                context.sandbox_result = json.dumps(
-                    {
-                        "status": "unresolved_cve",
-                        "message": "Skipping sandbox execution because no reproducible target is available",
-                        "target_spec": context.target_spec,
-                    },
-                    indent=2,
-                )
-                context.current_state = WorkflowState.SANDBOX_FAILED
-                context.log_step("Skipping sandbox execution: unresolved CVE target")
-                return context
+            result = ExecutionService().execute(
+                attack_script=context.attack_script,
+                target_spec=context.target_spec,
+                vulnerability_data=context.vulnerability_data,
+            )
 
-            # Validate attack script exists
-            if not context.attack_script:
-                return mark_infra_failure("No attack script available for execution")
-            
-            context.log_step(f"Attack script ready ({len(context.attack_script)} characters)")
-            if context.target_spec:
-                context.log_step(f"Using target spec: {context.target_spec.get('target_type')}")
-            
-            # Load sandbox configuration
-            config_path = Path(__file__).parent.parent / "config" / "sandbox_config.json"
-            
-            if not config_path.exists():
-                return mark_infra_failure(f"Sandbox config file not found: {config_path}")
-            
-            # Create SandboxManager with config file (uses load_config internally)
-            context.log_step("Initializing Sandbox Manager...")
-            sandbox_manager = SandboxManager(config_file=str(config_path))
-            sandbox_manager.environments = {
-                name: env
-                for name, env in sandbox_manager.environments.items()
-                if name == "Docker_Container"
-            }
+            context.sandbox_result = result.sandbox_result
+            for message in result.log_messages:
+                context.log_step(message)
 
-            target_type = (context.target_spec or {}).get("target_type")
-            docker_env = sandbox_manager.environments.get("Docker_Container")
-            if docker_env and context.target_spec:
-                selected_image = context.target_spec.get("docker_base_image")
-                if selected_image:
-                    docker_env.image = selected_image
-                    context.log_step(f"Using Docker image: {selected_image}")
-
-            if target_type == "cve_system_binary":
-                setup_commands = (context.target_spec.get("metadata") or {}).get("setup_commands", [])
-                if docker_env and setup_commands:
-                    docker_env.setup_commands = setup_commands
-            
-            if not sandbox_manager.environments:
-                return mark_infra_failure("Docker sandbox environment is not enabled in config")
-            
-            enabled_envs = list(sandbox_manager.environments.keys())
-            context.log_step(f"✓ Loaded {len(enabled_envs)} environment(s): {', '.join(enabled_envs)}")
-            
-            # Connect to all environments
-            context.log_step("Connecting to sandbox environments...")
-            if not sandbox_manager.connect_all():
-                return mark_infra_failure("Failed to connect to any sandbox environment")
-            
-            context.log_step("✓ Connected to sandbox environments")
-            
-            # Run basic test to verify environments are working
-            context.log_step("Running basic test on all environments...")
-            test_script = "print('Sandbox test successful')"
-            test_results = sandbox_manager.run_test_on_all(test_script)
-            
-            successful_tests = [name for name, result in test_results.items() if result.success]
-            failed_tests = [name for name, result in test_results.items() if not result.success]
-            
-            if not successful_tests:
-                details = {
-                    env_name: {
-                        "success": result.success,
-                        "output": getattr(result, "output", ""),
-                        "error": getattr(result, "error", ""),
-                    }
-                    for env_name, result in test_results.items()
-                }
-                return mark_infra_failure(
-                    f"All test runs failed. Failed environments: {', '.join(failed_tests)}",
-                    details,
-                )
-            
-            context.log_step(f"✓ Test passed in {len(successful_tests)} environment(s)")
-            if failed_tests:
-                context.log_step(f"⚠️ Test failed in: {', '.join(failed_tests)}")
-            
-            # Execute exploit in all connected environments
-            context.log_step("Executing attack script...")
-            if context.target_spec and context.target_spec.get("target_type") == "local_file":
-                source_path = context.target_spec.get("source_path")
-                remote_path = context.target_spec.get("container_target_path") or "/tmp/target"
-                upload_results = sandbox_manager.upload_vulnerable_file(source_path, remote_path)
-                if not any(upload_results.values()):
-                    return mark_infra_failure(
-                        "Failed to stage target file in sandbox",
-                        {"upload_results": upload_results, "remote_path": remote_path},
-                    )
-
-                script_type = "c" if str(context.attack_script).lstrip().startswith("#include") else "python"
-                target_result = sandbox_manager.generate_and_execute_attack(
-                    vulnerable_file_path=remote_path,
-                    attack_script=context.attack_script,
-                    script_type=script_type,
-                    vulnerability_data=context.vulnerability_data,
-                )
-                environment_results = target_result.get("environment_results", {})
-                results = {
-                    env_name: {
-                        "success": env_result.get("success", False),
-                        "execution_time": env_result.get("execution_time", 0),
-                        "output": env_result.get("output", ""),
-                        "error": env_result.get("error"),
-                        "exploitation_analysis": env_result.get("analysis", {}),
-                    }
-                    for env_name, env_result in environment_results.items()
-                }
-            elif context.target_spec and context.target_spec.get("target_type") == "cve_system_binary":
-                results = sandbox_manager.execute_exploit(
-                    exploit_script=context.attack_script,
-                    vulnerability_data=context.vulnerability_data,
-                )
-            else:
-                results = sandbox_manager.execute_exploit(
-                    exploit_script=context.attack_script,
-                    vulnerability_data=context.vulnerability_data
-                )
-            
-            # Store results
-            context.sandbox_result = json.dumps(results, indent=2)
-            
-            # Analyze results
-            successful_envs = []
-            failed_envs = []
-            
-            for env_name, result in results.items():
-                analysis = result.get('exploitation_analysis', {})
-                if analysis.get('exploitation_successful', False):
-                    successful_envs.append(env_name)
-                    context.log_step(f"✅ {env_name}: Attack successful!")
-                else:
-                    failed_envs.append(env_name)
-                    context.log_step(f"❌ {env_name}: Attack failed")
-            
-            # Determine overall success
-            if successful_envs:
+            if result.error_message:
+                context.set_error(result.error_message, WorkflowState.SANDBOX_FAILED)
+            elif result.success:
                 context.current_state = WorkflowState.SANDBOX_SUCCESS
-                context.log_step(f"✅ Attack succeeded in {len(successful_envs)} environment(s): {', '.join(successful_envs)}")
             else:
                 context.current_state = WorkflowState.SANDBOX_FAILED
-                context.log_step(f"⚠️ Attack failed in all {len(failed_envs)} environment(s)")
-            
-            # Cleanup
-            sandbox_manager.disconnect_all()
-            context.log_step("Sandbox cleanup completed")
             
         except Exception as e:
-            return mark_infra_failure(f"Sandbox execution error: {str(e)}")
+            payload = {
+                "status": "infrastructure_error",
+                "message": f"Sandbox execution error: {str(e)}",
+                "details": {},
+            }
+            context.sandbox_result = json.dumps({"infrastructure": payload}, indent=2)
+            context.set_error(payload["message"], WorkflowState.SANDBOX_FAILED)
         
         return context
     

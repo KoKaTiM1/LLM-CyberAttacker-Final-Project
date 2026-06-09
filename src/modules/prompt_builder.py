@@ -5,7 +5,7 @@ Selects the appropriate prompt style based on the active model profile,
 so each model gets instructions suited to how it generates code.
 """
 
-from .model_config import OLLAMA_MODEL, MODEL_PROFILES
+from .model_config import MODEL_PROFILES, active_main_model
 
 
 def build_exploit_prompt(vulnerability: dict, model: str = None) -> str:
@@ -14,13 +14,13 @@ def build_exploit_prompt(vulnerability: dict, model: str = None) -> str:
 
     Args:
         vulnerability: dict with keys Type, Location, Explanation
-        model: model name override (defaults to OLLAMA_MODEL)
+        model: model name override (defaults to the active main model)
 
     Returns:
         Prompt string ready to send to the LLM
     """
     if model is None:
-        model = OLLAMA_MODEL
+        model = active_main_model()
 
     profile = MODEL_PROFILES.get(model, MODEL_PROFILES["default"])
     style = profile["prompt_style"]

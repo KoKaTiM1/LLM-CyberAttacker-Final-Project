@@ -234,6 +234,53 @@ class DockerContainerEnvironment(SandboxEnvironment):
         self.setup_commands: List[str] = config.get("setup_commands", []) or []
         self.python_packages: List[str] = config.get("python_packages", []) or []
 
+    @staticmethod
+    def _build_python_install_prelude(packages: List[str]) -> str:
+        """Build the in-container package bootstrap script with concrete values."""
+        packages_literal = json.dumps(packages)
+        install_timeout = SANDBOX_COMMAND_TIMEOUT_SECONDS
+        return f"""
+import subprocess
+import sys
+import importlib
+
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        timeout={install_timeout},
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
+
     
     def connect(self) -> bool:
         """Connect to Docker environment"""
@@ -327,49 +374,7 @@ class DockerContainerEnvironment(SandboxEnvironment):
             if needs_pwntools and "pwntools" not in packages:
                 packages.append("pwntools")
 
-            # Build installer prelude
-            packages_literal = json.dumps(packages)
-            install_prelude = f"""
-import subprocess
-import sys
-import importlib
-
-_SANDBOX_PACKAGES = {packages_literal}
-_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
-
-def _ensure_sandbox_packages():
-    for pkg in _SANDBOX_PACKAGES:
-        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
-        try:
-            importlib.import_module(import_name)
-        except ImportError:
-            try:
-                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
-                candidate_cmds = [
-                    base_cmd + ['--break-system-packages'],
-                    base_cmd,
-                ]
-                last_error = ''
-                for cmd in candidate_cmds:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8',
-                errors='replace',
-                timeout=300,
-                    )
-                    if result.returncode == 0:
-                        break
-                    last_error = result.stderr
-                else:
-                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
-            except Exception as e:
-                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
-
-_ensure_sandbox_packages()
-
-"""
+            install_prelude = self._build_python_install_prelude(packages)
 
             wrapper_path = None
 
@@ -727,48 +732,7 @@ except ImportError:
                 if needs_pwntools and "pwntools" not in packages:
                     packages.append("pwntools")
 
-                packages_literal = json.dumps(packages)
-                install_prelude = f"""
-import subprocess
-import sys
-import importlib
-
-_SANDBOX_PACKAGES = {packages_literal}
-_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
-
-def _ensure_sandbox_packages():
-    for pkg in _SANDBOX_PACKAGES:
-        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
-        try:
-            importlib.import_module(import_name)
-        except ImportError:
-            try:
-                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
-                candidate_cmds = [
-                    base_cmd + ['--break-system-packages'],
-                    base_cmd,
-                ]
-                last_error = ''
-                for cmd in candidate_cmds:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8',
-                        errors='replace',
-                        timeout=SANDBOX_COMMAND_TIMEOUT_SECONDS,
-                    )
-                    if result.returncode == 0:
-                        break
-                    last_error = result.stderr
-                else:
-                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
-            except Exception as e:
-                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
-
-_ensure_sandbox_packages()
-
-"""
+                install_prelude = self._build_python_install_prelude(packages)
                 prepared_script = install_prelude + prepared_script
 
             # Create temp file for attack script
