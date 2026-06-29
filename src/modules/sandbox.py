@@ -8,6 +8,7 @@ Updated Sandbox System with Correct 3 Environments:
 import json
 import logging
 import re
+import shlex
 from abc import ABC, abstractmethod
 import subprocess
 import time
@@ -283,6 +284,45 @@ _ensure_sandbox_packages()
 
 """
 
+    @staticmethod
+    def _collect_python_packages(script_content: str, configured_packages: List[str]) -> List[str]:
+        """Collect Python packages required by a script."""
+        packages: List[str] = list(configured_packages or [])
+        needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+        if needs_pwntools and "pwntools" not in packages:
+            packages.append("pwntools")
+        return packages
+
+    @staticmethod
+    def _build_docker_python_runtime_bootstrap(packages: List[str]) -> str:
+        """Build a shell bootstrap that guarantees python and package availability."""
+        packages_literal = " ".join(shlex.quote(pkg) for pkg in packages)
+        return f"""# Guarantee a Python runtime for exploit execution
+if ! command -v python3 >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "[sandbox] python3 missing and apt-get unavailable in image"
+        exit 1
+    fi
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+        python3 python3-venv python3-pip ca-certificates >/tmp/python_runtime_setup.log 2>&1 \\
+        || (cat /tmp/python_runtime_setup.log && exit 1)
+fi
+
+rm -rf /tmp/sandbox_env
+python3 -m venv /tmp/sandbox_env >/tmp/python_venv_setup.log 2>&1 \\
+    || (cat /tmp/python_venv_setup.log && exit 1)
+
+SANDBOX_PYTHON=/tmp/sandbox_env/bin/python
+$SANDBOX_PYTHON -m pip install --upgrade pip setuptools wheel >/tmp/python_pip_setup.log 2>&1 \\
+    || (cat /tmp/python_pip_setup.log && exit 1)
+
+if [ -n "{packages_literal}" ]; then
+    $SANDBOX_PYTHON -m pip install --disable-pip-version-check --no-input {packages_literal} \\
+        >/tmp/python_pkg_setup.log 2>&1 || (cat /tmp/python_pkg_setup.log && exit 1)
+fi
+"""
+
     
     def connect(self) -> bool:
         """Connect to Docker environment"""
@@ -378,31 +418,23 @@ _ensure_sandbox_packages()
                 # For C, reuse existing implementation (no python packages needed)
                 return self._execute_c_script(script_content, start_time)
 
-            # Python execution path with on-demand package install and setup_commands
-            # Determine packages to ensure inside the container
-            packages: List[str] = list(self.python_packages or [])
-
-            # Detect explicit pwntools usage in script
-            needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
-            if needs_pwntools and "pwntools" not in packages:
-                packages.append("pwntools")
-
-            install_prelude = self._build_python_install_prelude(packages)
-
             wrapper_path = None
+            packages = self._collect_python_packages(script_content, self.python_packages)
 
-            # Write combined script (installer + user code) to a temp file
+            # Write user code to a temp file; runtime bootstrap happens in the wrapper.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-                f.write(install_prelude + script_content)
+                f.write(script_content)
                 temp_script_path = f.name
 
             try:
                 setup_block = "\n".join(self.setup_commands or [])
+                runtime_bootstrap = self._build_docker_python_runtime_bootstrap(packages)
                 wrapper_script = f"""#!/bin/bash
 set -e
 cd /tmp
 {setup_block}
-python3 /script.py
+{runtime_bootstrap}
+$SANDBOX_PYTHON /script.py
 """
 
                 with tempfile.NamedTemporaryFile(
@@ -740,13 +772,9 @@ except ImportError:
                         flags=re.DOTALL,
                     )
 
-                packages: List[str] = list(self.python_packages or [])
-                needs_pwntools = "from pwn import" in prepared_script or "import pwn" in prepared_script
-                if needs_pwntools and "pwntools" not in packages:
-                    packages.append("pwntools")
-
-                install_prelude = self._build_python_install_prelude(packages)
-                prepared_script = install_prelude + prepared_script
+                packages = self._collect_python_packages(prepared_script, self.python_packages)
+            else:
+                packages = []
 
             # Create temp file for attack script
             with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}',
@@ -756,6 +784,8 @@ except ImportError:
             
             # Create a comprehensive script that handles file creation and execution
             setup_block = "\n".join(self.setup_commands or [])
+            runtime_bootstrap = ""
+            python_exec = "python3"
             target_build_block = ""
             execution_target = target_file
             if target_file.endswith(".c"):
@@ -765,6 +795,9 @@ echo "Compiling C target: {target_file}"
 gcc {target_file} -o {execution_target} -fno-stack-protector -z execstack -no-pie
 chmod +x {execution_target}
 """
+            if script_type == "python":
+                runtime_bootstrap = self._build_docker_python_runtime_bootstrap(packages)
+                python_exec = "$SANDBOX_PYTHON"
 
             wrapper_script = f'''#!/bin/bash
 
@@ -773,6 +806,7 @@ export TERM=xterm
 
 # One-time container setup for tools and pip packages
 {setup_block}
+{runtime_bootstrap}
 
 # Create target file if it was uploaded
 if [ -n "$TARGET_FILE_CONTENT" ]; then
@@ -785,7 +819,7 @@ fi
 
 # Execute the attack script
 if [ "{script_type}" = "python" ]; then
-    python3 /attack.{script_type} {execution_target}
+    {python_exec} /attack.{script_type} {execution_target}
 elif [ "{script_type}" = "c" ]; then
     gcc /attack.{script_type} -o /tmp/attack_binary -w && /tmp/attack_binary {target_file}
 else

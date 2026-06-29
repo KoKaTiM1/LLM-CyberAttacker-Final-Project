@@ -17,6 +17,23 @@ def test_build_python_install_prelude_inlines_timeout_value():
     assert "'pwntools': 'pwn'" in prelude
 
 
+def test_docker_runtime_bootstrap_guarantees_python_and_packages():
+    bootstrap = DockerContainerEnvironment._build_docker_python_runtime_bootstrap(["pwntools", "requests"])
+
+    assert "command -v python3" in bootstrap
+    assert "apt-get install -y --no-install-recommends" in bootstrap
+    assert "python3 -m venv /tmp/sandbox_env" in bootstrap
+    assert "SANDBOX_PYTHON=/tmp/sandbox_env/bin/python" in bootstrap
+    assert "$SANDBOX_PYTHON -m pip install --upgrade pip setuptools wheel" in bootstrap
+    assert "pwntools requests" in bootstrap
+
+
+def test_collect_python_packages_adds_pwntools_when_script_imports_pwn():
+    packages = DockerContainerEnvironment._collect_python_packages("from pwn import *", ["requests"])
+
+    assert packages == ["requests", "pwntools"]
+
+
 def test_e2b_prelude_uses_instance_timeout_and_pwntools_import_map():
     env = E2BAPIEnvironment({"api_key": "test", "command_timeout_seconds": 321})
 
