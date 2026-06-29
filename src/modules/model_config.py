@@ -54,6 +54,10 @@ def fallback_inference_backend() -> str:
     return FALLBACK_INFERENCE_BACKEND
 
 MODEL_PROFILES = {
+    "model": {
+        "prompt_style": "explicit_pwntools",
+        "description": "Remote cluster alias mapped to the explicit pwntools prompt profile",
+    },
     "huihui_ai/deepseek-r1-abliterated:14b-qwen-distill": {
         "prompt_style": "explicit_pwntools",
         "description": "Abliterated DeepSeek-R1 14B — no refusals, strong code quality",

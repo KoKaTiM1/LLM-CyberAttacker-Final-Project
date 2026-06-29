@@ -159,6 +159,54 @@ def test_remote_openai_provider_retries_with_no_think_on_reasoning_only_response
     assert calls[1]["messages"][0]["content"].startswith("/no_think\n")
 
 
+def test_remote_openai_provider_falls_back_to_text_completion_when_chat_stays_reasoning_only(monkeypatch):
+    calls = []
+
+    def fake_post(url, json, headers, timeout):
+        calls.append((url, json))
+        if len(calls) <= 2:
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "thinking...",
+                            }
+                        }
+                    ]
+                }
+            )
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "text": "<think>draft</think>```python\nfrom pwn import *\n```",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("modules.inference_provider.requests.post", fake_post)
+
+    result = RemoteLlamaCppProvider(
+        url="http://cluster/v1/chat/completions",
+        default_model="remote-model",
+        api_style="openai",
+        max_tokens=321,
+    ).generate(
+        prompt="hello",
+        system="system",
+        stage="unit",
+    )
+
+    assert result.text == "```python\nfrom pwn import *\n```"
+    assert len(calls) == 3
+    assert calls[2][0] == "http://cluster/v1/completions"
+    assert calls[2][1]["prompt"].startswith("/no_think\nsystem\n\nhello")
+    assert calls[2][1]["max_tokens"] == 321
+
+
 def test_remote_openai_health_check_uses_single_token_probe(monkeypatch):
     calls = {}
 

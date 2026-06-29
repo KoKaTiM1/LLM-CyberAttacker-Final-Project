@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+from urllib.parse import urlparse, urlunparse
 from typing import Any, Dict, Optional
 
 import requests
@@ -249,6 +250,24 @@ class RemoteLlamaCppProvider(InferenceProvider):
             retry_response.raise_for_status()
             data = retry_response.json()
             text = self._extract_text(data)
+        if self.api_style == "openai" and not text and self._has_reasoning_only_response(data):
+            logger.warning("Remote chat completion still returned reasoning-only output; retrying via /v1/completions")
+            completion_payload = self._build_openai_text_completion_payload(
+                prompt=prompt,
+                system=system,
+                selected_model=selected_model,
+                temperature=temperature,
+                disable_thinking=True,
+            )
+            completion_response = requests.post(
+                self._completion_fallback_url(),
+                json=completion_payload,
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            completion_response.raise_for_status()
+            data = completion_response.json()
+            text = self._extract_text(data)
         metrics = build_llamacpp_metrics(
             stage=stage,
             model=selected_model,
@@ -288,6 +307,36 @@ class RemoteLlamaCppProvider(InferenceProvider):
         if self.max_tokens > 0:
             payload["max_tokens"] = self.max_tokens
         return payload
+
+    def _build_openai_text_completion_payload(
+        self,
+        *,
+        prompt: str,
+        system: str,
+        selected_model: str,
+        temperature: float,
+        disable_thinking: bool = False,
+    ) -> Dict[str, Any]:
+        completion_prompt = f"{system}\n\n{prompt}" if system else prompt
+        if disable_thinking:
+            completion_prompt = f"/no_think\n{completion_prompt}"
+
+        payload: Dict[str, Any] = {
+            "model": selected_model,
+            "prompt": completion_prompt,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if self.max_tokens > 0:
+            payload["max_tokens"] = self.max_tokens
+        return payload
+
+    def _completion_fallback_url(self) -> str:
+        parsed = urlparse(self.url)
+        if parsed.path.endswith("/v1/chat/completions"):
+            new_path = parsed.path[:-len("/chat/completions")] + "/completions"
+            return urlunparse(parsed._replace(path=new_path))
+        return self.url
 
     @staticmethod
     def _has_reasoning_only_response(data: Dict[str, Any]) -> bool:

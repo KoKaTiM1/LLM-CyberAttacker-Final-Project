@@ -24,12 +24,12 @@ from typing import Dict, Any, Callable, List, Optional
 from enum import Enum
 
 # Import existing components
-from .LLM import getFile, sendToLLM, sendToLLMWithDynamicPrompt, checkConnectionWithOllama, checkAPIconnectionWithAgent
+from .LLM import getFile, sendToLLM, sendToLLMWithDynamicPrompt, checkAPIconnectionWithAgent
 from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
 from .llm_utils import format_metric_log, merge_metric_totals
-from .services import ExecutionService, RagService
+from .services import ExecutionService, InferenceService, RagService
 from .target_spec import (
     build_cve_tool_target_spec,
     build_file_target_spec,
@@ -753,13 +753,13 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.CHECKING_CONNECTIONS
         
         try:
-            check1 = checkConnectionWithOllama()
+            check1 = InferenceService().health_check()
             if check1:
                 context.connections_ok = True
                 context.current_state = WorkflowState.CONNECTION_SUCCESS
                 context.log_step("All API connections successful")
             else:
-                error_msg = "LLM connection lost (Ollama not responding)"
+                error_msg = "LLM connection lost (configured inference backend not responding)"
                 context.set_error(error_msg, WorkflowState.CONNECTION_FAILED)
                 
         except Exception as e:
