@@ -8,6 +8,7 @@ Updated Sandbox System with Correct 3 Environments:
 import json
 import logging
 import re
+import shlex
 from abc import ABC, abstractmethod
 import subprocess
 import time
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 import argparse
 import tempfile
 import os
+import shutil
 from datetime import datetime
 from .model_config import SANDBOX_COMMAND_TIMEOUT_SECONDS
 
@@ -230,6 +232,7 @@ class DockerContainerEnvironment(SandboxEnvironment):
         self.container_name = config.get("container_name", "sandbox-test")
         self.docker_command = config.get("docker_command", "docker")
         self.container_id = None
+        self.pull_timeout = int(config.get("pull_timeout_seconds", 120))
         # Config-driven setup commands and Python packages
         self.setup_commands: List[str] = config.get("setup_commands", []) or []
         self.python_packages: List[str] = config.get("python_packages", []) or []
@@ -281,6 +284,45 @@ _ensure_sandbox_packages()
 
 """
 
+    @staticmethod
+    def _collect_python_packages(script_content: str, configured_packages: List[str]) -> List[str]:
+        """Collect Python packages required by a script."""
+        packages: List[str] = list(configured_packages or [])
+        needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
+        if needs_pwntools and "pwntools" not in packages:
+            packages.append("pwntools")
+        return packages
+
+    @staticmethod
+    def _build_docker_python_runtime_bootstrap(packages: List[str]) -> str:
+        """Build a shell bootstrap that guarantees python and package availability."""
+        packages_literal = " ".join(shlex.quote(pkg) for pkg in packages)
+        return f"""# Guarantee a Python runtime for exploit execution
+if ! command -v python3 >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "[sandbox] python3 missing and apt-get unavailable in image"
+        exit 1
+    fi
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+        python3 python3-venv python3-pip ca-certificates >/tmp/python_runtime_setup.log 2>&1 \\
+        || (cat /tmp/python_runtime_setup.log && exit 1)
+fi
+
+rm -rf /tmp/sandbox_env
+python3 -m venv /tmp/sandbox_env >/tmp/python_venv_setup.log 2>&1 \\
+    || (cat /tmp/python_venv_setup.log && exit 1)
+
+SANDBOX_PYTHON=/tmp/sandbox_env/bin/python
+$SANDBOX_PYTHON -m pip install --upgrade pip setuptools wheel >/tmp/python_pip_setup.log 2>&1 \\
+    || (cat /tmp/python_pip_setup.log && exit 1)
+
+if [ -n "{packages_literal}" ]; then
+    $SANDBOX_PYTHON -m pip install --disable-pip-version-check --no-input {packages_literal} \\
+        >/tmp/python_pkg_setup.log 2>&1 || (cat /tmp/python_pkg_setup.log && exit 1)
+fi
+"""
+
     
     def connect(self) -> bool:
         """Connect to Docker environment"""
@@ -299,19 +341,30 @@ _ensure_sandbox_packages()
                 logger.error("Docker is not available or not installed")
                 return False
             
-            # Pull the image if needed
-            logger.info(f"Pulling Docker image: {self.image}")
-            pull_result = subprocess.run(
-                [self.docker_command, "pull", self.image],
+            inspect_result = subprocess.run(
+                [self.docker_command, "image", "inspect", self.image],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=120
+                timeout=15
             )
-            
-            if pull_result.returncode != 0:
-                logger.warning(f"Could not pull image {self.image}, using existing")
+
+            if inspect_result.returncode == 0:
+                logger.info(f"Using existing Docker image: {self.image}")
+            else:
+                logger.info(f"Pulling Docker image: {self.image}")
+                pull_result = subprocess.run(
+                    [self.docker_command, "pull", self.image],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=self.pull_timeout
+                )
+                
+                if pull_result.returncode != 0:
+                    logger.warning(f"Could not pull image {self.image}, using existing if available")
             
             self.is_connected = True
             logger.info(f"Connected to Docker environment with image: {self.image}")
@@ -365,31 +418,23 @@ _ensure_sandbox_packages()
                 # For C, reuse existing implementation (no python packages needed)
                 return self._execute_c_script(script_content, start_time)
 
-            # Python execution path with on-demand package install and setup_commands
-            # Determine packages to ensure inside the container
-            packages: List[str] = list(self.python_packages or [])
-
-            # Detect explicit pwntools usage in script
-            needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
-            if needs_pwntools and "pwntools" not in packages:
-                packages.append("pwntools")
-
-            install_prelude = self._build_python_install_prelude(packages)
-
             wrapper_path = None
+            packages = self._collect_python_packages(script_content, self.python_packages)
 
-            # Write combined script (installer + user code) to a temp file
+            # Write user code to a temp file; runtime bootstrap happens in the wrapper.
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
-                f.write(install_prelude + script_content)
+                f.write(script_content)
                 temp_script_path = f.name
 
             try:
                 setup_block = "\n".join(self.setup_commands or [])
+                runtime_bootstrap = self._build_docker_python_runtime_bootstrap(packages)
                 wrapper_script = f"""#!/bin/bash
 set -e
 cd /tmp
 {setup_block}
-python3 /script.py
+{runtime_bootstrap}
+$SANDBOX_PYTHON /script.py
 """
 
                 with tempfile.NamedTemporaryFile(
@@ -727,13 +772,9 @@ except ImportError:
                         flags=re.DOTALL,
                     )
 
-                packages: List[str] = list(self.python_packages or [])
-                needs_pwntools = "from pwn import" in prepared_script or "import pwn" in prepared_script
-                if needs_pwntools and "pwntools" not in packages:
-                    packages.append("pwntools")
-
-                install_prelude = self._build_python_install_prelude(packages)
-                prepared_script = install_prelude + prepared_script
+                packages = self._collect_python_packages(prepared_script, self.python_packages)
+            else:
+                packages = []
 
             # Create temp file for attack script
             with tempfile.NamedTemporaryFile(mode='w', suffix=f'.{script_type}',
@@ -743,6 +784,8 @@ except ImportError:
             
             # Create a comprehensive script that handles file creation and execution
             setup_block = "\n".join(self.setup_commands or [])
+            runtime_bootstrap = ""
+            python_exec = "python3"
             target_build_block = ""
             execution_target = target_file
             if target_file.endswith(".c"):
@@ -752,6 +795,9 @@ echo "Compiling C target: {target_file}"
 gcc {target_file} -o {execution_target} -fno-stack-protector -z execstack -no-pie
 chmod +x {execution_target}
 """
+            if script_type == "python":
+                runtime_bootstrap = self._build_docker_python_runtime_bootstrap(packages)
+                python_exec = "$SANDBOX_PYTHON"
 
             wrapper_script = f'''#!/bin/bash
 
@@ -760,6 +806,7 @@ export TERM=xterm
 
 # One-time container setup for tools and pip packages
 {setup_block}
+{runtime_bootstrap}
 
 # Create target file if it was uploaded
 if [ -n "$TARGET_FILE_CONTENT" ]; then
@@ -772,7 +819,7 @@ fi
 
 # Execute the attack script
 if [ "{script_type}" = "python" ]; then
-    python3 /attack.{script_type} {execution_target}
+    {python_exec} /attack.{script_type} {execution_target}
 elif [ "{script_type}" = "c" ]; then
     gcc /attack.{script_type} -o /tmp/attack_binary -w && /tmp/attack_binary {target_file}
 else
@@ -855,6 +902,8 @@ class E2BAPIEnvironment(SandboxEnvironment):
         super().__init__("E2B_API", config)
         self.api_key = config.get("api_key", "")
         self.sandbox = None
+        self.sandbox_timeout = int(config.get("sandbox_timeout_seconds", 1800))
+        self.command_timeout = int(config.get("command_timeout_seconds", SANDBOX_COMMAND_TIMEOUT_SECONDS))
         # Config-driven Python packages for the E2B sandbox
         self.python_packages: List[str] = config.get("python_packages", []) or []
         
@@ -867,8 +916,8 @@ class E2BAPIEnvironment(SandboxEnvironment):
             # Import E2B SDK
             from e2b_code_interpreter import Sandbox
             
-            # Create a new sandbox with longer timeout
-            self.sandbox = Sandbox.create(timeout=300)
+            self.sandbox = Sandbox.create(timeout=self.sandbox_timeout)
+            self._refresh_timeout()
             self.is_connected = True
             logger.info(f"Connected to E2B API with sandbox ID: {self.sandbox.sandbox_id}")
             return True
@@ -879,6 +928,59 @@ class E2BAPIEnvironment(SandboxEnvironment):
         except Exception as e:
             logger.error(f"E2B API connection error: {e}")
             return False
+
+    def _refresh_timeout(self) -> None:
+        if not self.sandbox:
+            return
+        try:
+            if hasattr(self.sandbox, "set_timeout"):
+                self.sandbox.set_timeout(self.sandbox_timeout)
+        except Exception as e:
+            logger.warning(f"E2B sandbox timeout refresh failed: {e}")
+
+    def _build_python_install_prelude(self, packages: List[str]) -> str:
+        packages_literal = json.dumps(packages)
+        return f"""
+import subprocess
+import sys
+import importlib
+
+_SANDBOX_PACKAGES = {packages_literal}
+_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
+
+def _ensure_sandbox_packages():
+    for pkg in _SANDBOX_PACKAGES:
+        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
+        try:
+            importlib.import_module(import_name)
+        except ImportError:
+            try:
+                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                candidate_cmds = [
+                    base_cmd + ['--break-system-packages'],
+                    base_cmd,
+                ]
+                last_error = ''
+                for cmd in candidate_cmds:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        timeout={self.command_timeout},
+                    )
+                    if result.returncode == 0:
+                        break
+                    last_error = result.stderr
+                else:
+                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+            except Exception as e:
+                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
+
+_ensure_sandbox_packages()
+
+"""
     
     def disconnect(self) -> bool:
         """Disconnect from E2B API"""
@@ -914,6 +1016,7 @@ class E2BAPIEnvironment(SandboxEnvironment):
             )
         
         try:
+            self._refresh_timeout()
             if file_type.lower() == "c":
                 # Create Python wrapper for C code
                 final_script = self._create_c_wrapper(script_content)
@@ -925,52 +1028,10 @@ class E2BAPIEnvironment(SandboxEnvironment):
                 needs_pwntools = "from pwn import" in script_content or "import pwn" in script_content
                 if needs_pwntools and "pwntools" not in packages:
                     packages.append("pwntools")
-                
-                packages_literal = json.dumps(packages)
-                install_script = f"""
-import subprocess
-import sys
-import importlib
-
-_SANDBOX_PACKAGES = {packages_literal}
-_SANDBOX_IMPORT_MAP = {{'pwntools': 'pwn'}}
-
-def _ensure_sandbox_packages():
-    for pkg in _SANDBOX_PACKAGES:
-        import_name = _SANDBOX_IMPORT_MAP.get(pkg, pkg)
-        try:
-            importlib.import_module(import_name)
-        except ImportError:
-            try:
-                base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
-                candidate_cmds = [
-                    base_cmd + ['--break-system-packages'],
-                    base_cmd,
-                ]
-                last_error = ''
-                for cmd in candidate_cmds:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        encoding='utf-8',
-                errors='replace',
-                timeout=300,
-                    )
-                    if result.returncode == 0:
-                        break
-                    last_error = result.stderr
-                else:
-                    print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
-            except Exception as e:
-                print(f"[sandbox] Error installing {{pkg}}: {{e}}")
-
-_ensure_sandbox_packages()
-
-"""
+                install_script = self._build_python_install_prelude(packages)
                 final_script = install_script + script_content
                 
-            execution = self.sandbox.run_code(final_script, timeout=300)
+            execution = self.sandbox.run_code(final_script, timeout=self.command_timeout)
             
             execution_time = time.time() - start_time
             
@@ -1197,9 +1258,15 @@ print(f"File made executable: {file_path}")
             )
         
         try:
+            self._refresh_timeout()
             if script_type.lower() == "python":
+                packages: List[str] = list(self.python_packages or [])
+                needs_pwntools = "from pwn import" in attack_script or "import pwn" in attack_script
+                if needs_pwntools and "pwntools" not in packages:
+                    packages.append("pwntools")
+
                 # Execute Python attack script with target file argument
-                full_script = f"""
+                full_script = self._build_python_install_prelude(packages) + f"""
 import sys
 import os
 
@@ -1209,6 +1276,49 @@ sys.argv = ['attack.py', target_file]
 
 # Attack script:
 {attack_script}
+"""
+            elif script_type.lower() == "c":
+                full_script = f"""
+import subprocess
+import os
+import sys
+import tempfile
+
+attack_source = r'''{attack_script}'''
+target_file = r'''{target_file}'''
+
+with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False, encoding='utf-8') as f:
+    f.write(attack_source)
+    src_path = f.name
+
+binary_path = src_path[:-2]
+compile_result = subprocess.run(
+    ['gcc', src_path, '-o', binary_path, '-w'],
+    capture_output=True,
+    text=True,
+    encoding='utf-8',
+    errors='replace',
+    timeout={self.command_timeout},
+)
+
+if compile_result.returncode != 0:
+    print(compile_result.stdout)
+    print(compile_result.stderr, file=sys.stderr)
+    raise SystemExit(compile_result.returncode)
+
+run_result = subprocess.run(
+    [binary_path, target_file],
+    capture_output=True,
+    text=True,
+    encoding='utf-8',
+    errors='replace',
+    timeout={self.command_timeout},
+)
+if run_result.stdout:
+    print(run_result.stdout)
+if run_result.stderr:
+    print(run_result.stderr, file=sys.stderr)
+raise SystemExit(run_result.returncode)
 """
             else:
                 # For non-Python scripts, save and execute via shell
@@ -1228,13 +1338,13 @@ os.chmod('/tmp/attack_script', 0o755)
 result = subprocess.run(['/tmp/attack_script', '{target_file}'], 
                        capture_output=True, text=True, encoding='utf-8',
                 errors='replace',
-                timeout=120)
+                timeout={self.command_timeout})
 print(result.stdout)
 if result.stderr:
     print(f"Error: {{result.stderr}}", file=sys.stderr)
 """
             
-            result = self.sandbox.run_code(full_script, timeout=120)
+            result = self.sandbox.run_code(full_script, timeout=self.command_timeout)
             execution_time = time.time() - start_time
             
             return TestResult(
@@ -1265,13 +1375,59 @@ class VirtualBoxEnvironment(SandboxEnvironment):
         self.vm_name = config.get("vm_name", "")
         self.username = config.get("username", "")
         self.password = config.get("password", "")
-        self.vboxmanage_path = config.get("vboxmanage_path", "VBoxManage")
+        self.vboxmanage_path = self._resolve_vboxmanage_path(config.get("vboxmanage_path", "VBoxManage"))
         self.python_path = config.get("python_path", "/usr/bin/python3")
+        self.startup_wait_time = int(config.get("startup_wait_time", 90))
+        self.command_timeout = int(
+            config.get(
+                "command_timeout_seconds",
+                config.get("guest_additions_timeout", SANDBOX_COMMAND_TIMEOUT_SECONDS),
+            )
+        )
         # Config-driven setup commands and Python packages
         self.setup_commands: List[str] = config.get("setup_commands", []) or []
         self.python_packages: List[str] = config.get("python_packages", []) or []
         # Internal flag to ensure setup_commands run only once per VM session
         self._vm_setup_executed: bool = False
+
+    @staticmethod
+    def _resolve_vboxmanage_path(configured_path: str) -> str:
+        if configured_path and configured_path != "VBoxManage":
+            return configured_path
+
+        preferred_paths = [
+            r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe",
+            r"C:\Program Files (x86)\Oracle\VirtualBox\VBoxManage.exe",
+        ]
+        for path in preferred_paths:
+            if os.path.exists(path):
+                return path
+
+        return shutil.which("VBoxManage") or configured_path
+
+    def _guestcontrol_run_cmd(self, exe_path: str, *args: str) -> List[str]:
+        return [
+            self.vboxmanage_path, "guestcontrol", self.vm_name,
+            "run", "--username", self.username, "--password", self.password,
+            "--exe", exe_path, "--", *args,
+        ]
+
+    def _select_python_path(self) -> str:
+        venv_python = "/home/sandbox/env_sandbox/bin/python"
+        try:
+            result = subprocess.run(
+                self._guestcontrol_run_cmd("/bin/sh", "-lc", f"test -x {venv_python}"),
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=self.command_timeout,
+            )
+            if result.returncode == 0:
+                return venv_python
+        except Exception as exc:
+            logger.warning(f"VirtualBox venv python probe failed, falling back to {self.python_path}: {exc}")
+        return self.python_path
 
     def connect(self) -> bool:
         """Connect to VirtualBox VM"""
@@ -1322,7 +1478,7 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 
                 # Wait for VM to boot
                 logger.info("Waiting for VM to boot...")
-                time.sleep(90)
+                time.sleep(self.startup_wait_time)
             
             self.is_connected = True
             logger.info(f"Connected to VirtualBox VM: {self.vm_name}")
@@ -1426,17 +1582,15 @@ class VirtualBoxEnvironment(SandboxEnvironment):
                 for cmd in self.setup_commands:
                     try:
                         setup_cmd = [
-                            self.vboxmanage_path, "guestcontrol", self.vm_name,
-                            "run", "--username", self.username, "--password", self.password,
-                            "--exe", "/bin/bash", "--", "/bin/bash", "-lc", cmd,
+                            *self._guestcontrol_run_cmd("/bin/bash", "-lc", cmd),
                         ]
                         subprocess.run(
                             setup_cmd,
                             capture_output=True,
                             text=True,
                             encoding='utf-8',
-                errors='replace',
-                timeout=300,
+                            errors='replace',
+                            timeout=self.command_timeout,
                         )
                     except Exception as setup_err:
                         logger.warning(f"VirtualBox setup command failed (ignored): {setup_err}")
@@ -1488,14 +1642,34 @@ def _ensure_sandbox_packages():
                 if os.path.exists(venv_pip):
                     install_cmd = [venv_pip, 'install', pkg]
                 else:
-                    install_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
-                
+                    base_cmd = [sys.executable, '-m', 'pip', 'install', pkg]
+                    candidate_cmds = [
+                        base_cmd + ['--break-system-packages'],
+                        base_cmd,
+                    ]
+                    last_error = ''
+                    for install_cmd in candidate_cmds:
+                        print(f"[sandbox] Running: {{' '.join(install_cmd)}}")
+                        result = subprocess.run(
+                            install_cmd,
+                            capture_output=True,
+                            text=True,
+                            timeout={self.command_timeout},
+                        )
+                        if result.returncode == 0:
+                            print(f"[sandbox] Successfully installed {{pkg}}")
+                            break
+                        last_error = result.stderr
+                    else:
+                        print(f"[sandbox] Failed to install {{pkg}}: {{last_error}}")
+                    continue
+
                 print(f"[sandbox] Running: {{' '.join(install_cmd)}}")
                 result = subprocess.run(
                     install_cmd,
                     capture_output=True,
                     text=True,
-                    timeout=300,
+                    timeout={self.command_timeout},
                 )
                 if result.returncode == 0:
                     print(f"[sandbox] Successfully installed {{pkg}}")
@@ -1568,13 +1742,8 @@ _ensure_sandbox_packages()
                 error=f"Failed to copy script to VM: {copy_result.stderr}"
             )
         
-        # Execute script in VM using venv Python
-        venv_python = "/home/sandbox/env_sandbox/bin/python"
-        exec_cmd = [
-            self.vboxmanage_path, "guestcontrol", self.vm_name,
-            "run", "--username", self.username, "--password", self.password,
-            "--exe", venv_python, "--", script_file
-        ]
+        selected_python = self._select_python_path()
+        exec_cmd = self._guestcontrol_run_cmd(selected_python, script_file)
         
         exec_result = subprocess.run(
             exec_cmd,
@@ -1582,7 +1751,7 @@ _ensure_sandbox_packages()
             text=True,
             encoding='utf-8',
                 errors='replace',
-                timeout=500
+                timeout=self.command_timeout
         )
         
         execution_time = time.time() - start_time
@@ -1640,11 +1809,7 @@ _ensure_sandbox_packages()
             )
         
         # Compile C program in VM
-        compile_cmd = [
-            self.vboxmanage_path, "guestcontrol", self.vm_name,
-            "run", "--username", self.username, "--password", self.password,
-            "--exe", "/usr/bin/gcc", "--", "-o", binary_file, c_file, "-w"
-        ]
+        compile_cmd = self._guestcontrol_run_cmd("/usr/bin/gcc", "-o", binary_file, c_file, "-w")
         
         compile_result = subprocess.run(
             compile_cmd,
@@ -1652,7 +1817,7 @@ _ensure_sandbox_packages()
             text=True,
             encoding='utf-8',
                 errors='replace',
-                timeout=500
+                timeout=self.command_timeout
         )
         
         if compile_result.returncode != 0:
@@ -1666,11 +1831,7 @@ _ensure_sandbox_packages()
             )
         
         # Execute compiled program in VM
-        exec_cmd = [
-            self.vboxmanage_path, "guestcontrol", self.vm_name,
-            "run", "--username", self.username, "--password", self.password,
-            "--exe", binary_file
-        ]
+        exec_cmd = self._guestcontrol_run_cmd(binary_file)
         
         exec_result = subprocess.run(
             exec_cmd,
@@ -1678,7 +1839,7 @@ _ensure_sandbox_packages()
             text=True,
             encoding='utf-8',
                 errors='replace',
-                timeout=500
+                timeout=self.command_timeout
         )
         
         execution_time = time.time() - start_time
@@ -1709,19 +1870,15 @@ _ensure_sandbox_packages()
             
             if result.returncode == 0 and "VMState=\"running\"" in result.stdout:
                 # Try a simple command to verify guest functionality
-                test_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "run", "--username", self.username, "--password", self.password,
-                    "--exe", "/bin/echo", "--", "echo", "OK"
-                ]
+                test_cmd = self._guestcontrol_run_cmd("/bin/echo", "OK")
                 
                 test_result = subprocess.run(
                     test_cmd,
                     capture_output=True,
                     text=True,
                     encoding='utf-8',
-                errors='replace',
-                timeout=500
+                    errors='replace',
+                    timeout=self.command_timeout
                 )
                 
                 return test_result.returncode == 0
@@ -1782,11 +1939,7 @@ _ensure_sandbox_packages()
             return False
         
         try:
-            chmod_cmd = [
-                self.vboxmanage_path, "guestcontrol", self.vm_name,
-                "run", "--username", self.username, "--password", self.password,
-                "--exe", "/bin/chmod", "--", "+x", file_path
-            ]
+            chmod_cmd = self._guestcontrol_run_cmd("/bin/chmod", "+x", file_path)
             
             result = subprocess.run(
                 chmod_cmd,
@@ -1794,7 +1947,7 @@ _ensure_sandbox_packages()
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=500
+                timeout=self.command_timeout
             )
             
             if result.returncode == 0:
@@ -1865,29 +2018,21 @@ _ensure_sandbox_packages()
             
             # Execute attack script based on type
             if script_type.lower() == "python":
-                exec_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "run", "--username", self.username, "--password", self.password,
-                    "--exe", "/usr/bin/python3", "--", script_file_vm, target_file
-                ]
+                exec_cmd = self._guestcontrol_run_cmd(self._select_python_path(), script_file_vm, target_file)
             elif script_type.lower() == "c":
                 # Compile and execute C script
                 binary_file = "/tmp/attack_binary"
                 
                 # First compile
-                compile_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "run", "--username", self.username, "--password", self.password,
-                    "--exe", "/usr/bin/gcc", "--", script_file_vm, "-o", binary_file, "-w"
-                ]
+                compile_cmd = self._guestcontrol_run_cmd("/usr/bin/gcc", script_file_vm, "-o", binary_file, "-w")
                 
                 compile_result = subprocess.run(
                     compile_cmd,
                     capture_output=True,
                     text=True,
                     encoding='utf-8',
-                errors='replace',
-                timeout=500
+                    errors='replace',
+                    timeout=self.command_timeout
                 )
                 
                 if compile_result.returncode != 0:
@@ -1901,18 +2046,10 @@ _ensure_sandbox_packages()
                     )
                 
                 # Then execute
-                exec_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "run", "--username", self.username, "--password", self.password,
-                    "--exe", binary_file, "--", target_file
-                ]
+                exec_cmd = self._guestcontrol_run_cmd(binary_file, target_file)
             else:
                 # For shell scripts
-                exec_cmd = [
-                    self.vboxmanage_path, "guestcontrol", self.vm_name,
-                    "run", "--username", self.username, "--password", self.password,
-                    "--exe", "/bin/sh", "--", script_file_vm, target_file
-                ]
+                exec_cmd = self._guestcontrol_run_cmd("/bin/sh", script_file_vm, target_file)
             
             # Execute the attack
             exec_result = subprocess.run(
@@ -1921,7 +2058,7 @@ _ensure_sandbox_packages()
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                timeout=500  # Longer timeout for complex attacks
+                timeout=self.command_timeout
             )
             
             execution_time = time.time() - start_time
@@ -2041,7 +2178,17 @@ class SandboxManager:
             file_type = "c"
             logger.info(f"Auto-detected file type: {file_type}")
         
+        execution_order = []
+
         for name, env in self.environments.items():
+            if "VirtualBox" in name:
+                execution_order.append((name, env))
+
+        for name, env in self.environments.items():
+            if "VirtualBox" not in name:
+                execution_order.append((name, env))
+
+        for name, env in execution_order:
             if not env.is_connected:
                 logger.warning(f"Environment {name} is not connected, skipping")
                 continue

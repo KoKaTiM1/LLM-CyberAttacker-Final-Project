@@ -18,17 +18,18 @@ from pathlib import Path
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Dict, Any, Callable, List, Optional
 from enum import Enum
 
 # Import existing components
-from .LLM import getFile, sendToLLM, sendToLLMWithDynamicPrompt, checkConnectionWithOllama, checkAPIconnectionWithAgent
+from .LLM import getFile, sendToLLM, sendToLLMWithDynamicPrompt, checkAPIconnectionWithAgent
 from .Agent import resultsFromLLM, generateExploitWithDynamicPrompt
 from .orchestrator import PromptOrchestrator, AssembledPrompt
 from .cve_database import CVEDatabase
 from .llm_utils import format_metric_log, merge_metric_totals
-from .services import ExecutionService, RagService
+from .services import ExecutionService, InferenceService, RagService
 from .target_spec import (
     build_cve_tool_target_spec,
     build_file_target_spec,
@@ -158,10 +159,65 @@ def _escape_newlines_inside_json_strings(text: str) -> str:
     return "".join(result)
 
 
+def _extract_outer_json_object(text: str) -> str:
+    """Return the first balanced JSON object found inside arbitrary text."""
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx in range(start, len(text)):
+        char = text[idx]
+
+        if escape:
+            escape = False
+            continue
+
+        if char == "\\":
+            escape = True
+            continue
+
+        if char == '"':
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+
+    raise json.JSONDecodeError("Unterminated JSON object", text, start)
+
+
+def _clean_json_candidate(response_text: str) -> str:
+    """Normalize common LLM wrappers before JSON parsing."""
+    text = response_text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _normalize_vulnerability_payload(payload: Any) -> Dict[str, Any]:
+    """Normalize accepted model payloads into the workflow vulnerability schema."""
+    if isinstance(payload, dict) and "vulnerabilities" in payload:
+        return payload
+
+    if isinstance(payload, dict) and any(key in payload for key in VULNERABILITY_JSON_KEYS):
+        return {"vulnerabilities": [payload]}
+
+    raise ValueError("Parsed JSON did not match vulnerability schema")
+
+
 def _fallback_vulnerability_json(response_text: str) -> Dict[str, Any]:
     """Build a minimal vulnerability structure from a nearly-JSON response."""
-    import re
-
     extracted: Dict[str, str] = {}
     next_keys = "|".join(VULNERABILITY_JSON_KEYS)
 
@@ -186,14 +242,29 @@ def _fallback_vulnerability_json(response_text: str) -> Dict[str, Any]:
 
 def _parse_llm_vulnerability_json(response_text: str) -> Dict[str, Any]:
     """Parse LLM JSON output, repairing common malformed-string cases if needed."""
+    cleaned = _clean_json_candidate(response_text)
+    candidates = [cleaned]
+
     try:
-        return json.loads(response_text)
+        extracted = _extract_outer_json_object(cleaned)
+        if extracted != cleaned:
+            candidates.append(extracted)
     except json.JSONDecodeError:
-        repaired = _escape_newlines_inside_json_strings(response_text)
+        pass
+
+    for candidate in candidates:
         try:
-            return json.loads(repaired)
+            return _normalize_vulnerability_payload(json.loads(candidate))
         except json.JSONDecodeError:
-            return _fallback_vulnerability_json(response_text)
+            repaired = _escape_newlines_inside_json_strings(candidate)
+            try:
+                return _normalize_vulnerability_payload(json.loads(repaired))
+            except (json.JSONDecodeError, ValueError):
+                continue
+        except ValueError:
+            continue
+
+    return _fallback_vulnerability_json(cleaned)
 
 
 def _log_failed_prompt(context, reason: str) -> None:
@@ -682,13 +753,13 @@ class CyberAttackAgentWrapper:
         context.current_state = WorkflowState.CHECKING_CONNECTIONS
         
         try:
-            check1 = checkConnectionWithOllama()
+            check1 = InferenceService().health_check()
             if check1:
                 context.connections_ok = True
                 context.current_state = WorkflowState.CONNECTION_SUCCESS
                 context.log_step("All API connections successful")
             else:
-                error_msg = "LLM connection lost (Ollama not responding)"
+                error_msg = "LLM connection lost (configured inference backend not responding)"
                 context.set_error(error_msg, WorkflowState.CONNECTION_FAILED)
                 
         except Exception as e:
@@ -820,7 +891,7 @@ class CyberAttackAgentWrapper:
                 
                 # Use the existing sendToLLM function from LLM.py
                 # It already has its own prompt for C file vulnerability analysis
-                llm_response = sendToLLM(context.file_content)
+                llm_response = sendToLLM(context.file_content, context.rag_context)
                 
                 if not llm_response:
                     context.set_error("No response from LLM during file analysis", WorkflowState.ANALYSIS_FAILED)
@@ -885,10 +956,10 @@ class CyberAttackAgentWrapper:
                     
                     try:
                         # Try to parse as JSON
-                        context.vulnerability_data = json.loads(response_text)
+                        context.vulnerability_data = _parse_llm_vulnerability_json(response_text)
                         context.log_step(f"   Parsed vulnerability data successfully")
                         context.llm_response = response_text
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, ValueError):
                         # If not valid JSON, create a basic structure
                         context.log_step("⚠️ Response is not valid JSON, using fallback structure")
                         context.vulnerability_data = {

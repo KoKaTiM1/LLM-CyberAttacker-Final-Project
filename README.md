@@ -2,6 +2,63 @@
 
 AI-powered system that learns to generate and execute cyber attacks against vulnerable code.
 
+## 🚀 Run The Workflow
+
+The project is typically run through `langgraph dev`. Runtime backend selection is controlled by environment variables before launch, while the actual workflow input is provided in the UI.
+
+### Local Ollama + 3 sandboxes
+
+```powershell
+$env:INFERENCE_BACKEND='local'
+$env:FALLBACK_INFERENCE_BACKEND=''
+$env:LOCAL_OLLAMA_URL='http://127.0.0.1:11434/api/generate'
+$env:SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'
+langgraph dev
+```
+
+### Remote cluster model + 3 sandboxes
+
+If the remote model is exposed over an SSH tunnel, keep the tunnel open in a separate terminal:
+
+```powershell
+ssh -N -L 8080:HPC-RTX3070-07:8080 -J danielcohn@192.168.200.2 danielcohn@HPC-RTX3070-07
+```
+
+Then start LangGraph:
+
+```powershell
+$env:INFERENCE_BACKEND='remote'
+$env:FALLBACK_INFERENCE_BACKEND=''
+$env:REMOTE_LLAMACPP_URL='http://localhost:8080/v1/chat/completions'
+$env:REMOTE_LLAMACPP_API_STYLE='openai'
+$env:REMOTE_LLM_MODEL='Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf'
+$env:REMOTE_RAG_LLM_MODEL='Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf'
+$env:REMOTE_LLAMACPP_TIMEOUT_SECONDS='1200'
+$env:OLLAMA_TIMEOUT_SECONDS='1200'
+$env:SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'
+langgraph dev
+```
+
+### UI input examples
+
+After `langgraph dev` opens, fill only the workflow input fields in the UI.
+
+#### CVE mode
+
+- `Input Type`: `cve`
+- `Cve Id`: `CVE-2008-0888`
+
+#### File mode
+
+- `Input Type`: `file`
+- `File Path`: `src/data/LCP-Data set/Files/File1.txt`
+
+### Important notes
+
+- The old benchmark JSON/JSONL files are logs only. They do not configure a new `langgraph dev` run.
+- `SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'` is what enables all 3 sandbox backends for the current run.
+- `local` or `remote` is not entered in the UI. It is selected by environment variables before launch.
+
 ## 📋 Project Components
 
 - **Agent.py** - Main LLM agent orchestrating attacks

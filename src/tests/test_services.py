@@ -43,6 +43,53 @@ def test_rag_service_returns_original_input_when_index_missing(tmp_path):
     assert result.log_messages
 
 
+def test_rag_service_keeps_file_content_separate_from_rag_context(tmp_path, monkeypatch):
+    def fake_call_agentic_rag(**kwargs):
+        return {
+            "final_answer": "Relevant context about strcpy and missing bounds checks.",
+            "metrics": {},
+        }
+
+    monkeypatch.setattr("modules.rag.agent_rag.call_agentic_rag", fake_call_agentic_rag)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "cve.db").write_text("", encoding="utf-8")
+    (data_dir / "cve.index").write_text("", encoding="utf-8")
+
+    result = RagService(project_root=tmp_path).enrich(
+        input_type="file",
+        file_content="int main() { return 0; }",
+    )
+
+    assert result.file_content == "int main() { return 0; }"
+    assert result.rag_context == "Relevant context about strcpy and missing bounds checks."
+
+
+def test_rag_service_drops_low_signal_rag_context(tmp_path, monkeypatch):
+    def fake_call_agentic_rag(**kwargs):
+        return {
+            "final_answer": "the " * 200,
+            "metrics": {},
+        }
+
+    monkeypatch.setattr("modules.rag.agent_rag.call_agentic_rag", fake_call_agentic_rag)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "cve.db").write_text("", encoding="utf-8")
+    (data_dir / "cve.index").write_text("", encoding="utf-8")
+
+    result = RagService(project_root=tmp_path).enrich(
+        input_type="file",
+        file_content="int main() { return 0; }",
+    )
+
+    assert result.file_content == "int main() { return 0; }"
+    assert result.rag_context == ""
+    assert "Dropped low-signal RAG context before downstream analysis" in result.log_messages
+
+
 def test_execution_service_short_circuits_unresolved_cve():
     result = ExecutionService(config_path=Path("missing.json")).execute(
         attack_script="print('unused')",
@@ -103,3 +150,25 @@ def test_execution_service_reports_file_staging_as_infrastructure_error(tmp_path
     assert result.error_message == "Failed to stage target file in sandbox"
     assert "infrastructure_error" in result.sandbox_result
     assert "Sandbox cleanup completed" in result.log_messages
+
+
+def test_execution_service_defaults_to_docker_when_filter_is_unset(monkeypatch):
+    monkeypatch.delenv("SANDBOX_ENVIRONMENT_FILTER", raising=False)
+
+    requested = ExecutionService._requested_environment_names()
+
+    assert requested == ["Docker_Container"]
+    assert ExecutionService._environment_matches("Docker_Container", requested) is True
+    assert ExecutionService._environment_matches("E2B_API", requested) is False
+    assert ExecutionService._environment_matches("VirtualBox", requested) is False
+
+
+def test_execution_service_matches_requested_non_docker_environments(monkeypatch):
+    monkeypatch.setenv("SANDBOX_ENVIRONMENT_FILTER", "e2b,vm")
+
+    requested = ExecutionService._requested_environment_names()
+
+    assert requested == ["e2b", "vm"]
+    assert ExecutionService._environment_matches("Docker_Container", requested) is False
+    assert ExecutionService._environment_matches("E2B_API", requested) is True
+    assert ExecutionService._environment_matches("VirtualBox", requested) is True

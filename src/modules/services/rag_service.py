@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -64,17 +66,47 @@ class RagService:
             model_name="all-MiniLM-L6-v2",
         )
         rag_text = (rag_result or {}).get("final_answer", "")
-        result.rag_context = rag_text
+        cleaned_rag_text = self._clean_rag_text(rag_text)
+        result.rag_context = cleaned_rag_text
         result.metric = self._normalize_metric((rag_result or {}).get("metrics", {}))
         result.log_messages.append("RAG node completed successfully")
 
-        if rag_text:
-            if input_type == "cve":
-                result.user_prompt = f"{user_prompt}\n\n[RAG Context]\n{rag_text}\n"
-            else:
-                result.file_content = f"{file_content}\n\n[RAG Context]\n{rag_text}\n"
+        if rag_text and not cleaned_rag_text:
+            result.log_messages.append("Dropped low-signal RAG context before downstream analysis")
+
+        if cleaned_rag_text and input_type == "cve":
+            result.user_prompt = f"{user_prompt}\n\n[RAG Context]\n{cleaned_rag_text}\n"
 
         return result
+
+    @staticmethod
+    def _clean_rag_text(rag_text: str) -> str:
+        text = (rag_text or "").strip()
+        if not text:
+            return ""
+
+        text = re.sub(r"\s+", " ", text).strip()
+        if RagService._looks_low_signal(text):
+            return ""
+
+        return text
+
+    @staticmethod
+    def _looks_low_signal(text: str) -> bool:
+        tokens = re.findall(r"[A-Za-z0-9_./:-]+", text.lower())
+        if len(tokens) < 40:
+            return False
+
+        unique_ratio = len(set(tokens)) / max(len(tokens), 1)
+        top_count = Counter(tokens).most_common(1)[0][1]
+        top_ratio = top_count / len(tokens)
+
+        if unique_ratio < 0.2:
+            return True
+        if top_ratio > 0.3:
+            return True
+
+        return False
 
     @staticmethod
     def _build_query(

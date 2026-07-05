@@ -1,5 +1,8 @@
 from pathlib import Path
+from datetime import datetime
+import json
 import logging
+import re
 
 from .inference_provider import get_main_model
 from .services.inference_service import InferenceService
@@ -44,15 +47,35 @@ def checkAPIconnectionWithAgent() -> bool:
 
 def _clean_structured_response(response_text: str) -> str:
     response_text = response_text.strip()
-    if response_text.startswith("```json"):
-        response_text = response_text[7:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-    elif response_text.startswith("```"):
-        response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
+    response_text = re.sub(r"^```(?:json)?\s*", "", response_text, flags=re.IGNORECASE)
+    response_text = re.sub(r"\s*```$", "", response_text)
     return response_text.strip()
+
+
+def _write_analysis_trace(
+    *,
+    stage: str,
+    model: str,
+    prompt: str,
+    response_text: str,
+    raw_payload,
+    error_message: str = "",
+) -> None:
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    trace_path = logs_dir / f"analysis_trace_{stage}_{ts}.json"
+    trace = {
+        "timestamp": ts,
+        "stage": stage,
+        "model": model,
+        "prompt": prompt,
+        "response_text": response_text,
+        "raw_payload": raw_payload,
+        "error_message": error_message,
+    }
+    trace_path.write_text(json.dumps(trace, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    logger.info(f"📝 Analysis trace saved to {trace_path}")
 
 
 def sendToLLMWithDynamicPrompt(system_prompt: str, user_prompt: str, model: str = None):
@@ -84,16 +107,34 @@ def sendToLLMWithDynamicPrompt(system_prompt: str, user_prompt: str, model: str 
         logger.info("--- LLM RESPONSE START ---")
         logger.info(payload["response"])
         logger.info("--- LLM RESPONSE END ---")
+        _write_analysis_trace(
+            stage="cve_analysis",
+            model=selected_model,
+            prompt=combined_prompt,
+            response_text=payload["response"],
+            raw_payload=result.raw,
+        )
         return payload
     except Exception as e:
+        _write_analysis_trace(
+            stage="cve_analysis",
+            model=selected_model,
+            prompt=combined_prompt,
+            response_text="",
+            raw_payload={},
+            error_message=str(e),
+        )
         logger.error(f"Request failed: {e}")
         return None
 
 
-def sendToLLM(content):
+def sendToLLM(content, rag_context: str = ""):
     prompt = (
         "You are a security code reviewer for C files. "
         "Please analyze the following C file and identify potential vulnerabilities. "
+        "Return ONLY valid JSON. "
+        "Do not include markdown fences, comments, prose, bullets, or explanatory text before or after the JSON. "
+        "If you are unsure about a field, use an empty string or \"Unknown\" instead of adding explanation outside the JSON. "
         "Return the results in valid JSON format with EXACTLY these field names: "
         "'Type', 'Location', 'Severity', 'Explanation', and 'SuggestedFix'. "
         "Use this exact format:\n"
@@ -110,6 +151,15 @@ def sendToLLM(content):
         "}\n\n"
         f"{content}"
     )
+
+    if rag_context:
+        prompt += (
+            "\n\n[Relevant RAG Context]\n"
+            "Use the following context only if it is directly relevant to the code under review. "
+            "Do not copy it verbatim into the output. "
+            "Ignore it if it is generic, repetitive, or not specific to this file.\n"
+            f"{rag_context[:3000]}"
+        )
 
     logger.info("=" * 60)
     logger.info("[sendToLLM] SENDING REQUEST TO LLM")
@@ -130,7 +180,26 @@ def sendToLLM(content):
         logger.info("--- LLM RESPONSE START ---")
         logger.info(payload["response"])
         logger.info("--- LLM RESPONSE END ---")
+        if not payload["response"]:
+            logger.warning("LLM response text was empty after extraction")
+            logger.warning(f"Raw response keys: {list((payload or {}).keys())}")
+            logger.warning(f"Raw response preview: {str(result.raw)[:1200]}")
+        _write_analysis_trace(
+            stage="file_analysis",
+            model=get_main_model(),
+            prompt=prompt,
+            response_text=payload["response"],
+            raw_payload=result.raw,
+        )
         return payload
     except Exception as e:
+        _write_analysis_trace(
+            stage="file_analysis",
+            model=get_main_model(),
+            prompt=prompt,
+            response_text="",
+            raw_payload={},
+            error_message=str(e),
+        )
         logger.error(f"Request failed: {e}")
         return None

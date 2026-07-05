@@ -1,10 +1,16 @@
 import os
 import sys
+import importlib
 
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.inference_provider import LocalOllamaProvider, RemoteLlamaCppProvider
+from modules.inference_provider import (
+    FallbackInferenceProvider,
+    InferenceResult,
+    LocalOllamaProvider,
+    RemoteLlamaCppProvider,
+)
 
 
 class FakeResponse:
@@ -73,3 +79,201 @@ def test_remote_llamacpp_provider_reads_raw_completion(monkeypatch):
     assert result.model == "remote-model"
     assert result.metrics["prompt_tokens"] == 10
     assert result.metrics["tokens_per_second"] == 40
+
+
+def test_remote_openai_provider_sends_max_tokens_when_configured(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json, headers, timeout):
+        captured["json"] = json
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "remote answer"},
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("modules.inference_provider.requests.post", fake_post)
+
+    result = RemoteLlamaCppProvider(
+        url="http://cluster/v1/chat/completions",
+        default_model="remote-model",
+        api_style="openai",
+        max_tokens=321,
+    ).generate(
+        prompt="hello",
+        system="system",
+        stage="unit",
+    )
+
+    assert result.text == "remote answer"
+    assert captured["json"]["max_tokens"] == 321
+
+
+def test_remote_openai_provider_retries_with_no_think_on_reasoning_only_response(monkeypatch):
+    calls = []
+
+    def fake_post(url, json, headers, timeout):
+        calls.append(json)
+        if len(calls) == 1:
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "the " * 200,
+                            }
+                        }
+                    ]
+                }
+            )
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "{\"vulnerabilities\": []}"},
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("modules.inference_provider.requests.post", fake_post)
+
+    result = RemoteLlamaCppProvider(
+        url="http://cluster/v1/chat/completions",
+        default_model="remote-model",
+        api_style="openai",
+        max_tokens=321,
+    ).generate(
+        prompt="hello",
+        system="system",
+        stage="unit",
+    )
+
+    assert result.text == '{"vulnerabilities": []}'
+    assert len(calls) == 2
+    assert calls[1]["messages"][0]["content"].startswith("/no_think\n")
+
+
+def test_remote_openai_provider_falls_back_to_text_completion_when_chat_stays_reasoning_only(monkeypatch):
+    calls = []
+
+    def fake_post(url, json, headers, timeout):
+        calls.append((url, json))
+        if len(calls) <= 2:
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "reasoning_content": "thinking...",
+                            }
+                        }
+                    ]
+                }
+            )
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "text": "<think>draft</think>```python\nfrom pwn import *\n```",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("modules.inference_provider.requests.post", fake_post)
+
+    result = RemoteLlamaCppProvider(
+        url="http://cluster/v1/chat/completions",
+        default_model="remote-model",
+        api_style="openai",
+        max_tokens=321,
+    ).generate(
+        prompt="hello",
+        system="system",
+        stage="unit",
+    )
+
+    assert result.text == "```python\nfrom pwn import *\n```"
+    assert len(calls) == 3
+    assert calls[2][0] == "http://cluster/v1/completions"
+    assert calls[2][1]["prompt"].startswith("/no_think\nsystem\n\nhello")
+    assert calls[2][1]["max_tokens"] == 321
+
+
+def test_remote_openai_health_check_uses_single_token_probe(monkeypatch):
+    calls = {}
+
+    def fake_post(url, json, headers, timeout):
+        calls["url"] = url
+        calls["json"] = json
+        calls["timeout"] = timeout
+        return FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"content": "ok"},
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("modules.inference_provider.requests.post", fake_post)
+
+    provider = RemoteLlamaCppProvider(
+        url="http://cluster/v1/chat/completions",
+        default_model="remote-model",
+        api_style="openai",
+        timeout=321,
+    )
+
+    assert provider.health_check() is True
+    assert calls["url"] == "http://cluster/v1/chat/completions"
+    assert calls["json"]["max_tokens"] == 1
+    assert calls["json"]["messages"][0]["content"] == "ping"
+    assert calls["timeout"] == 321
+
+
+def test_fallback_provider_uses_local_when_remote_fails():
+    class FailingProvider:
+        def health_check(self):
+            return False
+
+        def generate(self, **kwargs):
+            raise RuntimeError("remote down")
+
+    class LocalProvider:
+        def health_check(self):
+            return True
+
+        def generate(self, **kwargs):
+            return InferenceResult(text="local answer", model="local-model", metrics={}, raw={})
+
+    provider = FallbackInferenceProvider(FailingProvider(), LocalProvider())
+
+    result = provider.generate(prompt="hello", stage="unit")
+
+    assert result.text == "local answer"
+    assert provider.health_check() is True
+
+
+def test_remote_timeout_can_be_configured_via_env(monkeypatch):
+    monkeypatch.setenv("REMOTE_LLAMACPP_TIMEOUT_SECONDS", "321")
+    monkeypatch.setenv("INFERENCE_BACKEND", "remote")
+    monkeypatch.setenv("FALLBACK_INFERENCE_BACKEND", "")
+
+    import modules.model_config as model_config
+    import modules.inference_provider as inference_provider
+
+    importlib.reload(model_config)
+    importlib.reload(inference_provider)
+
+    provider = inference_provider.RemoteLlamaCppProvider()
+
+    assert provider.timeout == 321
