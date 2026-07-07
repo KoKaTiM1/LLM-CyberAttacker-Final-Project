@@ -309,17 +309,58 @@ if ! command -v python3 >/dev/null 2>&1; then
         || (cat /tmp/python_runtime_setup.log && exit 1)
 fi
 
-rm -rf /tmp/sandbox_env
-python3 -m venv /tmp/sandbox_env >/tmp/python_venv_setup.log 2>&1 \\
-    || (cat /tmp/python_venv_setup.log && exit 1)
+ensure_python_pip() {{
+    if "$1" -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
 
-SANDBOX_PYTHON=/tmp/sandbox_env/bin/python
-$SANDBOX_PYTHON -m pip install --upgrade pip setuptools wheel >/tmp/python_pip_setup.log 2>&1 \\
+    if "$1" -m ensurepip --upgrade >/tmp/python_ensurepip.log 2>&1; then
+        return 0
+    fi
+
+    if ! command -v wget >/dev/null 2>&1; then
+        if ! command -v apt-get >/dev/null 2>&1; then
+            cat /tmp/python_ensurepip.log
+            echo "[sandbox] pip missing and wget unavailable for bootstrap"
+            exit 1
+        fi
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wget >/tmp/python_wget_setup.log 2>&1 \\
+            || (cat /tmp/python_wget_setup.log && exit 1)
+    fi
+
+    wget -q -O /tmp/get-pip.py https://bootstrap.pypa.io/get-pip.py \\
+        || (echo "[sandbox] failed downloading get-pip.py" && exit 1)
+    "$1" /tmp/get-pip.py --break-system-packages >/tmp/python_getpip.log 2>&1 \\
+        || (cat /tmp/python_ensurepip.log && cat /tmp/python_getpip.log && exit 1)
+}}
+
+install_python_packages() {{
+    if [ -z "$2" ]; then
+        return 0
+    fi
+
+    "$1" -m pip install --disable-pip-version-check --no-input $2 >/tmp/python_pkg_setup.log 2>&1 \\
+        || "$1" -m pip install --disable-pip-version-check --no-input --break-system-packages $2 >/tmp/python_pkg_setup.log 2>&1 \\
+        || (cat /tmp/python_pkg_setup.log && exit 1)
+}}
+
+rm -rf /tmp/sandbox_env
+SANDBOX_PYTHON=python3
+if python3 -m venv /tmp/sandbox_env >/tmp/python_venv_setup.log 2>&1; then
+    SANDBOX_PYTHON=/tmp/sandbox_env/bin/python
+else
+    echo "[sandbox] Warning: venv creation failed, using system python"
+    cat /tmp/python_venv_setup.log
+fi
+
+ensure_python_pip "$SANDBOX_PYTHON"
+$SANDBOX_PYTHON -m pip install --disable-pip-version-check --no-input --upgrade pip setuptools wheel >/tmp/python_pip_setup.log 2>&1 \\
+    || $SANDBOX_PYTHON -m pip install --disable-pip-version-check --no-input --break-system-packages --upgrade pip setuptools wheel >/tmp/python_pip_setup.log 2>&1 \\
     || (cat /tmp/python_pip_setup.log && exit 1)
 
 if [ -n "{packages_literal}" ]; then
-    $SANDBOX_PYTHON -m pip install --disable-pip-version-check --no-input {packages_literal} \\
-        >/tmp/python_pkg_setup.log 2>&1 || (cat /tmp/python_pkg_setup.log && exit 1)
+    install_python_packages "$SANDBOX_PYTHON" "{packages_literal}"
 fi
 """
 
