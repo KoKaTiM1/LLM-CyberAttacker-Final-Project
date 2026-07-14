@@ -6,12 +6,28 @@ AI-powered system that learns to generate and execute cyber attacks against vuln
 
 The project is typically run through `langgraph dev`. Runtime backend selection is controlled by environment variables before launch, while the actual workflow input is provided in the UI.
 
-### Local Ollama + 3 sandboxes
+### Local Ollama + Docker
 
 ```powershell
 $env:INFERENCE_BACKEND='local'
 $env:FALLBACK_INFERENCE_BACKEND=''
 $env:LOCAL_OLLAMA_URL='http://127.0.0.1:11434/api/generate'
+$env:OLLAMA_TIMEOUT_SECONDS='1200'
+$env:LOCAL_LLM_MODEL='huihui_ai/deepseek-r1-abliterated:14b-qwen-distill'
+$env:LOCAL_RAG_LLM_MODEL='llama3.2:1b'
+$env:SANDBOX_ENVIRONMENT_FILTER='docker'
+langgraph dev
+```
+
+### Local Ollama + Docker, E2B, and VM
+
+```powershell
+$env:INFERENCE_BACKEND='local'
+$env:FALLBACK_INFERENCE_BACKEND=''
+$env:LOCAL_OLLAMA_URL='http://127.0.0.1:11434/api/generate'
+$env:OLLAMA_TIMEOUT_SECONDS='1200'
+$env:LOCAL_LLM_MODEL='huihui_ai/deepseek-r1-abliterated:14b-qwen-distill'
+$env:LOCAL_RAG_LLM_MODEL='llama3.2:1b'
 $env:SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'
 langgraph dev
 ```
@@ -56,8 +72,10 @@ After `langgraph dev` opens, fill only the workflow input fields in the UI.
 ### Important notes
 
 - The old benchmark JSON/JSONL files are logs only. They do not configure a new `langgraph dev` run.
-- `SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'` is what enables all 3 sandbox backends for the current run.
+- `SANDBOX_ENVIRONMENT_FILTER='docker'` runs only Docker.
+- `SANDBOX_ENVIRONMENT_FILTER='docker,e2b,vm'` enables all 3 sandbox backends for the current run.
 - `local` or `remote` is not entered in the UI. It is selected by environment variables before launch.
+- If Ollama returns `cudaMalloc failed: out of memory`, the local main model is too large for the currently available GPU memory. Use a smaller model or free VRAM before retrying.
 
 ## 📋 Project Components
 
