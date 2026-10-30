@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -26,7 +27,13 @@ class ExecutionService:
     """Local sandbox execution service. Docker stays local in this phase."""
 
     def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path or Path(__file__).parent.parent.parent / "config" / "sandbox_config.json"
+        if config_path is not None:
+            self.config_path = config_path
+        else:
+            repo_root = Path(__file__).resolve().parents[3]
+            root_config = repo_root / "sandbox_config.json"
+            src_config = repo_root / "src" / "config" / "sandbox_config.json"
+            self.config_path = root_config if root_config.exists() else src_config
 
     def execute(
         self,
@@ -60,10 +67,11 @@ class ExecutionService:
             return self._infra_failure(f"Sandbox config file not found: {self.config_path}")
 
         sandbox_manager = SandboxManager(config_file=str(self.config_path))
+        requested_envs = self._requested_environment_names()
         sandbox_manager.environments = {
             name: env
             for name, env in sandbox_manager.environments.items()
-            if name == "Docker_Container"
+            if self._environment_matches(name, requested_envs)
         }
 
         target_type = (target_spec or {}).get("target_type")
@@ -80,7 +88,8 @@ class ExecutionService:
                 docker_env.setup_commands = setup_commands
 
         if not sandbox_manager.environments:
-            return self._infra_failure("Docker sandbox environment is not enabled in config")
+            requested = ", ".join(requested_envs) if requested_envs else "Docker_Container"
+            return self._infra_failure(f"Requested sandbox environment(s) not enabled in config: {requested}")
 
         enabled_envs = list(sandbox_manager.environments.keys())
         logs.append(f"Loaded {len(enabled_envs)} environment(s): {', '.join(enabled_envs)}")
@@ -208,3 +217,36 @@ class ExecutionService:
             error_message=message,
             log_messages=log_messages or [],
         )
+
+    @staticmethod
+    def _requested_environment_names() -> list[str]:
+        raw = os.getenv("SANDBOX_ENVIRONMENT_FILTER", "").strip()
+        if not raw:
+            return ["Docker_Container"]
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    @staticmethod
+    def _environment_matches(name: str, requested_envs: list[str]) -> bool:
+        if not requested_envs:
+            return False
+
+        canonical = name.strip().lower()
+        aliases = {
+            canonical,
+            canonical.replace("_", ""),
+            canonical.replace("_", " ").replace("container", "").strip(),
+        }
+
+        if canonical == "docker_container":
+            aliases.update({"docker", "docker_container", "dockercontainer"})
+        elif canonical == "e2b_api":
+            aliases.update({"e2b", "e2b_api", "e2bapi"})
+        elif canonical == "virtualbox":
+            aliases.update({"vm", "virtualbox", "virtual_box"})
+
+        for requested in requested_envs:
+            normalized = requested.strip().lower().replace("-", "_")
+            normalized_compact = normalized.replace("_", "")
+            if normalized in aliases or normalized_compact in aliases:
+                return True
+        return False
